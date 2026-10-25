@@ -1,0 +1,15 @@
+# Build context for the one-task container image.
+node_modules/
+tasks/
+.dsh/
+.scratch/
+.git/
+.gitignore
+docs/
+tests/
+README.md
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example

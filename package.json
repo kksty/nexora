@@ -1,0 +1,25 @@
+{
+  "name": "liebian",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nexora：由平等执行者组成的自主探索系统",
+  "bin": {
+    "liebian": "./bin/liebian.js",
+    "liebian-mcp": "./bin/liebian-mcp.js"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests",
+    "typecheck": "tsc -p tsconfig.json",
+    "probe:harness": "node scripts/probe-real-harness.mjs",
+    "probe:steer": "node scripts/probe-command-steer.mjs",
+    "probe:terminal": "node scripts/probe-terminal.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}

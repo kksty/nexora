@@ -1,0 +1,65 @@
+name: liebian
+
+# The Web UI writes one compose service per started task into this file. It is
+# included so the host's `docker compose ps/down/up` manages web and tasks as a
+# single project. The initial file only contains an empty services map.
+include:
+  - path: compose/tasks.yaml
+
+services:
+  web:
+    build:
+      context: .
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        DOCKER_CLI_IMAGE: ${DOCKER_CLI_IMAGE:-docker:27-cli}
+    image: liebian:latest
+    container_name: liebian-web
+    command: ["web"]
+    network_mode: host
+    volumes:
+      # 相对路径：compose 会相对本文件所在目录解析。
+      - ./tasks:/tasks
+      - ./.dsh:/dsh-home
+      # 生成的 Task service 文件；Web 容器用 docker compose 启停它们。
+      - ./compose:/app/compose
+      # Web UI 用宿主机 Docker 启动同级 Task 容器。只有这个受信任的管理容器
+      # 拿到 socket；Task 容器永远不挂载它。
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      LIEBIAN_TASKS_DIR: /tasks
+      DSH_HOME: /dsh-home
+      LIEBIAN_WEB_LAUNCHER: compose
+      LIEBIAN_WEB_IN_CONTAINER: "1"
+      LIEBIAN_WEB_CONTAINER: liebian-web
+      LIEBIAN_COMPOSE_FILE: /app/compose.yaml
+      LIEBIAN_TASKS_COMPOSE_FILE: /app/compose/tasks.yaml
+      LIEBIAN_COMPOSE_PROJECT: liebian
+      LIEBIAN_IMAGE: liebian:latest
+      LIEBIAN_WEB_HOST: ${LIEBIAN_WEB_HOST:-127.0.0.1}
+      LIEBIAN_WEB_PORT: ${LIEBIAN_WEB_PORT:-43187}
+      LIEBIAN_API_PORT_RANGE: ${LIEBIAN_API_PORT_RANGE:-43188-43287}
+      LIEBIAN_TASK_START_TIMEOUT_MS: ${LIEBIAN_TASK_START_TIMEOUT_MS:-60000}
+      LIEBIAN_CALLBACK_HOST: ${LIEBIAN_CALLBACK_HOST:-}
+      # 留空则随机生成，并从 `docker compose logs web` 读取。
+      LIEBIAN_WEB_TOKEN: ${LIEBIAN_WEB_TOKEN:-}
+      LIEBIAN_WEB_PUBLIC_URL: ${LIEBIAN_WEB_PUBLIC_URL:-}
+      LIEBIAN_WEB_ALLOWED_ORIGINS: ${LIEBIAN_WEB_ALLOWED_ORIGINS:-}
+      LIEBIAN_PROVIDER: ${LIEBIAN_PROVIDER:-deepseek-official}
+      LIEBIAN_MODEL: ${LIEBIAN_MODEL:-deepseek-flash}
+      LIEBIAN_MODEL_CONCURRENCY: ${LIEBIAN_MODEL_CONCURRENCY:-4}
+      LIEBIAN_MODEL_STREAM_IDLE_MS: ${LIEBIAN_MODEL_STREAM_IDLE_MS:-120000}
+      LIEBIAN_DIAGNOSTICS_INTERVAL_MS: ${LIEBIAN_DIAGNOSTICS_INTERVAL_MS:-30000}
+      LIEBIAN_DIAGNOSTICS_MAX_BYTES: ${LIEBIAN_DIAGNOSTICS_MAX_BYTES:-16777216}
+      LIEBIAN_DIAGNOSTICS_FILES: ${LIEBIAN_DIAGNOSTICS_FILES:-8}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${LIEBIAN_WEB_PORT}/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped

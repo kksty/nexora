@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Nexora · 工作空间</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">N</div>
+        <div class="brand-text">
+          <h1>Nexora</h1>
+          <p>NEXORA WORKSPACE</p>
+        </div>
+      </div>
+
+      <div class="workspace-label"><span class="workspace-avatar">N</span><div>我的工作空间<small>自主探索与协作</small></div><span class="workspace-tag">LOCAL</span></div>
+      <button class="nav-home active" id="workspace-home" type="button"><span aria-hidden="true">▦</span> 工作空间概览 <span class="nav-arrow">↗</span></button>
+      <div class="side-section-label">任务中心 <span id="sidebar-count">0</span></div>
+      <div class="side-tools">
+        <label class="search">
+          <span class="search-icon">⌕</span>
+          <input id="task-search" type="search" placeholder="搜索任务…" autocomplete="off">
+        </label>
+        <button class="btn primary block" id="new-task" type="button">＋ 新建任务</button>
+      </div>
+
+      <div class="task-list" id="task-list">
+        <div class="side-hint">正在加载任务…</div>
+      </div>
+
+      <div class="side-footer">
+        <button class="btn ghost block settings-entry" id="api-settings" type="button">⚙ <span>模型与 API 配置</span><span>↗</span></button>
+        <button class="btn ghost block" id="delete-task" type="button" hidden>删除当前任务</button>
+        <div class="conn" id="conn">
+          <i id="conn-dot"></i><span id="conn-text">连接中…</span>
+        </div>
+        <div class="path" id="tasks-root" title="任务目录"></div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <div class="workspace-topbar"><div>工作空间 <span>/</span> <strong id="breadcrumb">概览</strong></div><div class="topbar-right"><span class="local-label">本地工作空间</span><span class="user-avatar">N</span></div></div>
+      <section class="dashboard" id="dashboard">
+        <header class="dashboard-heading"><div><div class="eyebrow">WORKSPACE OVERVIEW</div><h2>让想法，持续向前。</h2><p>从任务出发，让执行者探索、协作，直到达成目标。</p></div><button class="btn primary" id="dashboard-new-task" type="button">＋ 创建任务</button></header>
+        <div class="dashboard-metrics" id="dashboard-metrics" aria-live="polite"></div>
+        <div class="dashboard-columns"><section class="task-directory"><div class="directory-heading"><div><h3>全部任务 <span id="directory-count">0</span></h3><p>掌握每一个探索的进展</p></div><button class="btn" type="button" data-action="refresh">↻ 刷新</button></div><div class="directory-toolbar"><div class="status-filters" id="status-filters" aria-label="筛选任务状态"><button type="button" class="active" data-status="all" aria-pressed="true">全部</button><button type="button" data-status="active" aria-pressed="false">进行中</button><button type="button" data-status="completed" aria-pressed="false">已完成</button><button type="button" data-status="stopped" aria-pressed="false">已停止</button></div><label class="search"><span aria-hidden="true">⌕</span><input id="dashboard-search" type="search" placeholder="搜索任务或目标" aria-label="搜索全部任务"></label></div><div id="dashboard-tasks"><div class="empty-hint">正在加载工作空间…</div></div></section><aside class="dashboard-aside"><section class="guide-card"><span class="guide-icon" aria-hidden="true">✳</span><div class="eyebrow">FROM IDEA TO OUTCOME</div><h3>一个目标，<br>多条探索路径。</h3><p>执行者自主拆解方向，共享发现，通过共识确认任务完成。</p><div class="guide-step"><b>01</b><div>定义任务<small>描述起点与期待的终点</small></div></div><div class="guide-step"><b>02</b><div>协同探索<small>随时查看进度与发送指令</small></div></div><div class="guide-step"><b>03</b><div>沉淀结果<small>汇聚发现、文件和完成共识</small></div></div></section><div class="workspace-note"><span aria-hidden="true">◈</span><div><strong>你的探索，有迹可循</strong><p>任务中的发现、消息与日志会保留在本地工作空间。</p></div></div></aside></div>
+      </section>
+      <section class="empty-state" id="empty-state" hidden>
+        <div class="empty-mark">N</div>
+        <h2>从一个任务开始</h2>
+        <p>这里查看执行者、共享发现、消息和完成共识；运行中的任务会实时刷新。</p>
+        <button class="btn primary" id="empty-new-task" type="button">新建任务</button>
+      </section>
+
+      <section class="task-view" id="task-view" hidden>
+        <header class="task-header">
+          <div class="task-heading">
+            <div class="eyebrow">任务</div>
+            <h2 id="task-title">—</h2>
+            <div class="task-sub" id="task-sub"></div>
+          </div>
+          <div class="task-actions" id="task-actions"></div>
+        </header>
+
+        <nav class="tabs" id="tabs" aria-label="任务视图">
+          <button class="tab active" type="button" data-tab="overview">概览</button>
+          <button class="tab" type="button" data-tab="works">执行者 <span class="tab-count" id="count-works"></span></button>
+          <button class="tab" type="button" data-tab="findings">发现 <span class="tab-count" id="count-findings"></span></button>
+          <button class="tab" type="button" data-tab="messages">消息 <span class="tab-count" id="count-messages"></span></button>
+          <button class="tab" type="button" data-tab="commands">命令 <span class="tab-count" id="count-commands"></span></button>
+          <button class="tab" type="button" data-tab="rounds">共识 <span class="tab-count" id="count-rounds"></span></button>
+          <button class="tab" type="button" data-tab="files">文件与日志</button>
+        </nav>
+
+        <div class="panels" id="panels">
+          <section class="panel" data-panel="overview"></section>
+          <section class="panel" data-panel="works" hidden></section>
+          <section class="panel" data-panel="findings" hidden></section>
+          <section class="panel" data-panel="messages" hidden></section>
+          <section class="panel" data-panel="commands" hidden></section>
+          <section class="panel" data-panel="rounds" hidden></section>
+          <section class="panel" data-panel="files" hidden></section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-root" aria-live="polite"></div>
+  <noscript><div class="noscript">Web UI 需要启用 JavaScript。</div></noscript>
+  <script type="module" src="/assets/app.js"></script>
+  <script type="module" src="/assets/admin.js"></script>
+</body>
+</html>
