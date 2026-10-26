@@ -104,17 +104,41 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY bin ./bin
 COPY src ./src
+# The agent prompts are template literals, so a stray backtick silently breaks
+# the module and every task container dies at startup. Nothing else parses them
+# during the build; fail here instead of at task start.
+RUN node -e "import('./src/core/prompt.ts').then(() => console.log('prompt module ok'))"
 COPY scripts ./scripts
 COPY docker ./docker
 COPY compose.yaml ./compose.yaml
 COPY compose ./compose
+
+# Repair the Messages client for gateways that emit a tool call's argument
+# deltas after closing that block. Without it such a stream is rejected as
+# MALFORMED_RESPONSE and the executor burns every retry without doing any work.
+RUN node docker/patch-harness-llm.mjs
+
+# Legacy TLS renegotiation stays opt-in: `curl` is wrapped so it retries with
+# /etc/ssl/openssl-legacy.cnf only when a peer actually requires it. Targets
+# running old TLS stacks are common in security testing, and OpenSSL 3 refuses
+# them by default.
+COPY docker/openssl-legacy.cnf /etc/ssl/openssl-legacy.cnf
+COPY docker/bin/curl /usr/local/bin/curl
+RUN chmod 0755 /usr/local/bin/curl /etc/ssl/openssl-legacy.cnf
 
 # Containerized Web UI: the docker CLI and compose plugin start one sibling
 # Task service per task through the mounted /var/run/docker.sock.
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
-RUN chmod +x /app/bin/liebian.js /app/bin/liebian-mcp.js /app/docker/entrypoint.sh \
+# Strip CR from the shell entrypoint: a Windows checkout may carry CRLF line
+# endings, which turn the shebang into '#!/usr/bin/env bash\r' and make the
+# container fail with "'bash\r': No such file or directory". tr is used instead
+# of sed so the result is deterministic under /bin/sh (dash) as well.
+RUN tr -d '\r' < /app/docker/entrypoint.sh > /tmp/entrypoint.sh \
+ && mv /tmp/entrypoint.sh /app/docker/entrypoint.sh \
+ && chmod 0755 /app/docker/entrypoint.sh \
+ && chmod +x /app/bin/liebian.js /app/bin/liebian-mcp.js \
  && printf '%s\n' '#!/usr/bin/env bash' 'exec node /app/bin/liebian.js "$@"' > /usr/local/bin/liebian \
  && printf '%s\n' '#!/usr/bin/env bash' 'exec node /app/bin/liebian-mcp.js "$@"' > /usr/local/bin/liebian-mcp \
  && chmod +x /usr/local/bin/liebian /usr/local/bin/liebian-mcp \

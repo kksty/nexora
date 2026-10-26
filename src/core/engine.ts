@@ -256,6 +256,15 @@ interface ContinueResult {
   idempotent: boolean
 }
 
+/** A resume opens a run like a continue does, but records no command. */
+export interface ResumeResult {
+  text: string
+  run: RunRecord
+  work: WorkRecord
+  command: null
+  idempotent: boolean
+}
+
 interface RecoverResult {
   text: string
   run: RunRecord
@@ -798,6 +807,118 @@ export class Engine {
         `任务保持同一 ID，发现、证据、报告和仍有效的用户要求继续保留；旧轮次的完成记录与表态不改动，也不参与本轮共识。\n` +
         `若运行时尚未启动该 work，请启动任务运行时。`
     return { ...committed, text: textOut }
+  }
+
+  /**
+   * Reopen a stopped task without a human instruction.
+   *
+   * Restarting used to require typing a continue command, which forced the
+   * operator to invent a sentence just to get the same work going again. A
+   * resume opens a fresh run with a successor work but records no command: the
+   * executor boots from shared state exactly like the task's first work does.
+   * Findings, evidence, the report and still-valid user requirements survive.
+   */
+  async resumeTask(input: { requestId: string; source?: 'web' | 'cli' | 'api' }): Promise<ResumeResult> {
+    const requestId = requireText(input.requestId, 'request_id', MAX_REQUEST_ID)
+    if (!/^[A-Za-z0-9._:-]+$/.test(requestId)) {
+      throw new AppError('INVALID_ARGUMENT', 'request_id 只能包含字母、数字、点、下划线和连字符')
+    }
+    const source = input.source ?? 'api'
+    if (!COMMAND_SOURCES.includes(source)) {
+      throw new AppError('INVALID_ARGUMENT', `未知命令来源：${String(source)}`)
+    }
+
+    const committed = await this.mutex.run(async () => {
+      const previousResume = this.state.runs.find((run) => run.resumeRequestId === requestId)
+      if (previousResume !== undefined) {
+        const work = previousResume.workIds
+          .map((id) => this.state.works[id])
+          .find((item): item is WorkRecord => item !== undefined)
+        if (work === undefined) {
+          throw new AppError('STATE_CORRUPT', `重启请求 ${requestId} 的记录缺少 work`)
+        }
+        return { run: previousResume, work, idempotent: true }
+      }
+
+      if (this.state.status === 'active') {
+        const participants = this.activeIds()
+        throw new AppError(
+          'TASK_ACTIVE',
+          participants.length === 0
+            ? '任务正在进行中但没有参与 work；请使用“恢复工作”创建承接执行者。'
+            : '任务正在进行中；无需重启，可直接发送命令。',
+          { runId: this.state.currentRunId, participants },
+        )
+      }
+      const previousRun = this.currentRunLocked()
+      if (previousRun.status === 'active') {
+        throw new AppError('STATE_CORRUPT', '任务不是 active，但当前运行轮次仍为 active')
+      }
+      if (previousRun.cleanup !== 'done') {
+        previousRun.cleanup = 'done'
+        previousRun.cleanupAt = nowIso()
+        previousRun.cleanupNote = '重启前已确认上一轮受管理执行停止'
+      }
+
+      const sequence = ++this.state.counters.run
+      const run = createRunRecord({
+        sequence,
+        targetVersion: this.state.targetVersion,
+        resumeRequestId: requestId,
+      })
+      this.state.runs.push(run)
+      this.state.currentRunId = run.id
+      this.state.status = 'active'
+      this.state.statusReason = undefined
+      this.state.completion = null
+      this.state.currentRoundId = null
+      this.state.interruptedAt = undefined
+      this.roundReopenPending = false
+      this.stoppedAll = false
+      if (this.stopAllTimer !== undefined) {
+        clearTimeout(this.stopAllTimer)
+        this.stopAllTimer = undefined
+      }
+      if (this.roundReopenTimer !== undefined) {
+        clearTimeout(this.roundReopenTimer)
+        this.roundReopenTimer = undefined
+      }
+
+      const work = this.createWorkLocked(
+        null,
+        '任务重启：无人值守继续，执行者按共享状态自行判断下一步。',
+        '',
+        [],
+        'continue',
+      )
+      work.direction = `继续任务（${run.id}，重启后恢复）`
+      await this.persistLocked()
+      this.journalLocked('task-resumed', {
+        runId: run.id,
+        workId: work.id,
+        previousRunId: previousRun.id,
+        previousStatus: previousRun.status,
+      })
+      this.events.emit('all', 'task-resumed', `任务以新一轮 ${run.id} 重启继续，未附加人工命令`)
+      return { run, work, idempotent: false }
+    })
+
+    if (!committed.idempotent) {
+      this.pendingActions += 1
+      try {
+        if (this.dispatch && !this.closing) {
+          await this.bootWork(committed.work.id, false)
+        }
+      } finally {
+        this.pendingActions -= 1
+      }
+      this.scheduleCompletionCheck()
+    }
+    const text = committed.idempotent
+      ? `request ID 已提交过，返回原重启结果：轮次 ${committed.run.id}，work ${committed.work.id}。`
+      : `已在同一任务中开启新一轮 ${committed.run.id}，work ${committed.work.id} 继续执行（未附加人工命令）。\n` +
+        `执行者启动时会先读取任务定义、有效发现和活跃 work 表，再自行决定下一步。`
+    return { run: committed.run, work: committed.work, command: null, idempotent: committed.idempotent, text }
   }
 
   /**

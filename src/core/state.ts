@@ -27,6 +27,7 @@ export function createRunRecord(input: {
   status?: RunRecord['status']
   continueRequestId?: string
   continueText?: string
+  resumeRequestId?: string
 }): RunRecord {
   const at = input.at ?? nowIso()
   const status = input.status ?? 'active'
@@ -43,6 +44,7 @@ export function createRunRecord(input: {
     completion: null,
     ...(input.continueRequestId === undefined ? {} : { continueRequestId: input.continueRequestId }),
     ...(input.continueText === undefined ? {} : { continueText: input.continueText }),
+    ...(input.resumeRequestId === undefined ? {} : { resumeRequestId: input.resumeRequestId }),
     recoveries: [],
     cleanup: status === 'active' ? 'none' : 'pending',
   }

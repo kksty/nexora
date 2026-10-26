@@ -8,7 +8,7 @@
  * echoed back in a result.
  */
 import { AppError, describeError } from '../util/errors.ts'
-import { loadWebSettings } from './settings.ts'
+import { resolveWebSettings } from './settings.ts'
 
 export interface ModelConfigInput {
   apiKey?: unknown
@@ -139,28 +139,40 @@ function extractModelIds(payload: unknown): string[] {
 
 /**
  * Resolve the effective settings: explicitly supplied form values win, then the
- * saved Web UI settings, then the process environment.
+ * saved Web UI settings, then the process environment, then the defaults.
+ *
+ * Any provider name is accepted. `deepseek-official` is merely the one that has
+ * a built-in endpoint; every other provider - a self-hosted gateway, a vendor
+ * proxy, "pai", ... - works as long as a Base URL is configured, either through
+ * LIEBIAN_BASE_URL / DEEPSEEK_BASE_URL or in the Web UI.
  */
 export async function resolveModelConfig(tasksRoot: string, input: ModelConfigInput): Promise<ConfigResolution> {
   const requestKey = text(input.apiKey)
   if (requestKey.length > 4096) throw new AppError('INVALID_ARGUMENT', 'API Key 过长')
-  const saved = await loadWebSettings(tasksRoot)
-  const savedKey = saved.apiKey
-  const envKey = (process.env.DEEPSEEK_API_KEY ?? '').trim()
+  const resolved = await resolveWebSettings(tasksRoot)
+  const saved = resolved.settings
 
-  const apiKey = requestKey || savedKey || envKey
+  const apiKey = requestKey || saved.apiKey
   const apiKeySource: ApiKeySource =
-    requestKey.length > 0 ? 'request' : savedKey.length > 0 ? 'saved' : envKey.length > 0 ? 'environment' : 'none'
-  const provider = text(input.provider) || saved.provider || process.env.LIEBIAN_PROVIDER || 'deepseek-official'
-  const model = text(input.model) || saved.model || process.env.LIEBIAN_MODEL || 'deepseek-flash'
-  const configuredBase = text(input.baseUrl) || saved.baseUrl || (process.env.DEEPSEEK_BASE_URL ?? '').trim()
+    requestKey.length > 0
+      ? 'request'
+      : resolved.sources.apiKey === 'saved'
+        ? 'saved'
+        : resolved.sources.apiKey === 'environment'
+          ? 'environment'
+          : 'none'
+  const provider = text(input.provider) || saved.provider
+  const model = text(input.model) || saved.model
+  const configuredBase = text(input.baseUrl) || saved.baseUrl
   const identity = { apiKey, apiKeySource, provider, model }
 
   if (apiKey.length === 0) {
     return {
       ok: false,
       config: identity,
-      message: '没有可用的 API Key：请在弹窗中填写，或保存配置，或在启动 Web UI 的环境里设置 DEEPSEEK_API_KEY。',
+      message:
+        '没有可用的 API Key：请在弹窗中填写，或保存配置，或在启动 Web UI 的环境里设置 ' +
+        'LIEBIAN_API_KEY（兼容旧名 DEEPSEEK_API_KEY）。',
     }
   }
 
@@ -174,7 +186,9 @@ export async function resolveModelConfig(tasksRoot: string, input: ModelConfigIn
     return {
       ok: false,
       config: identity,
-      message: `provider「${provider}」不是内置的 deepseek-official，请填写 OpenAI 兼容的 Base URL。`,
+      message:
+        `provider「${provider}」没有可用的 Base URL：请填写 OpenAI 兼容的 Base URL，` +
+        '或设置环境变量 LIEBIAN_BASE_URL（兼容旧名 DEEPSEEK_BASE_URL）。',
     }
   }
   const baseUrl = normalizeBaseUrl(rawBase)

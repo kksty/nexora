@@ -1,0 +1,16 @@
+# OpenSSL configuration that re-enables legacy (unsafe) renegotiation.
+#
+# OpenSSL 3 disables it by default, so any client built against it fails with
+# "unsafe legacy renegotiation disabled" against older TLS stacks. Pentest
+# targets still run such stacks, so the option is kept in a dedicated file
+# rather than in the global default: nothing is relaxed unless a caller opts in.
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+Options = UnsafeLegacyRenegotiation

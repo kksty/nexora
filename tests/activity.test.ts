@@ -395,12 +395,27 @@ test('退出的 work 仍有遗留活动时，剩余 work 必须核对后才能�
   await harness.engine.retireWork('W-0001', { reason: '交接后退出' })
   await harness.engine.whenQuiet()
 
+  // The surviving work must still be alive for this scenario to mean anything.
+  // Assert it explicitly so a future regression reports the real cause instead
+  // of an opaque WORK_EXITED from deep inside the engine.
+  assert.equal(harness.engine.state.works['W-0002']?.runtimeStatus, 'idle', '承接 work 应当仍存活')
+
   const proposal = await harness.engine.proposeCompletion('W-0002', {})
   await harness.engine.respondCompletion('W-0002', {
     round_id: proposal.round.id,
     opinion: 'agree',
   })
-  await new Promise((resolve) => setTimeout(resolve, 80))
+  // The completion check runs asynchronously. Waiting for the blocker itself is
+  // deterministic; the fixed 80ms sleep this replaced turned host load into a
+  // flaky failure that had nothing to do with the behaviour under test.
+  await waitUntil(
+    async () => {
+      const current = await harness.engine.completionStatus('W-0002')
+      return current.blockers.some((item) => item.includes('已退出 work 的遗留活动'))
+    },
+    3_000,
+    '退出 work 的遗留活动成为阻塞项',
+  )
   assert.equal(harness.engine.state.status, 'active')
   let status = await harness.engine.completionStatus('W-0002')
   assert.ok(status.blockers.some((item) => item.includes('已退出 work 的遗留活动')))

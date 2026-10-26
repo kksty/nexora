@@ -57,7 +57,7 @@ Windows 使用已启用 host networking 的 Docker Desktop；Linux 使用原生 
 
 | 检查 | 结果 |
 | --- | --- |
-| `npm test` | 176 项通过，0 失败、0 跳过（极端故障与诊断扩展后重跑） |
+| `npm test` | 179 项：177 通过、0 失败、2 跳过（MCP 客户端包未安装时跳过该两项） |
 | `npm run typecheck` | 通过 |
 | Compose 配置与镜像构建 | 通过 |
 | bash 后台任务探针 | 通过 |

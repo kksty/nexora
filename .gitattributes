@@ -1,0 +1,12 @@
+# Keep LF line endings for everything that runs inside the Linux container.
+# A CRLF checkout breaks shell shebangs ('bash\r': No such file or directory)
+# and can corrupt .dockerignore patterns.
+* text=auto eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf

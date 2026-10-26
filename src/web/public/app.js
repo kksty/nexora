@@ -415,7 +415,8 @@ function renderDetail(options = {}) {
     actions.push(`<button class="btn" type="button" data-action="edit-end">修改终点</button>`)
     actions.push(`<button class="btn ghost" type="button" data-action="edit-start">修改起始</button>`)
   } else {
-    actions.push(`<button class="btn primary" type="button" data-action="continue">继续并发送</button>`)
+    actions.push(`<button class="btn primary" type="button" data-action="resume">继续</button>`)
+    actions.push(`<button class="btn" type="button" data-action="continue">继续并发送指令</button>`)
     if (summary.status === 'completed') {
       actions.push(
         `<button class="btn" type="button" data-action="open-file" data-path="runtime/consensus/consensus.md">查看完成共识</button>`,
@@ -464,6 +465,14 @@ function renderActivePanel() {
   if (detail === null) return
   const panel = $(`#panels .panel[data-panel="${state.tab}"]`)
   if (panel === null) return
+  // Re-rendering replaces the whole subtree. That drops the sticky file list's
+  // own scroll offset and can pull the page back to the top mid-read, which is
+  // why a live task (every `change` event re-renders) felt like it "jumped".
+  const pageY = window.scrollY
+  const fileList = panel.querySelector('.file-list')
+  const fileListTop = fileList === null ? null : fileList.scrollTop
+  const preview = panel.querySelector('#file-view .md-body, #file-view pre, #file-view .journal-list')
+  const previewTop = preview === null ? null : preview.scrollTop
   switch (state.tab) {
     case 'overview':
       panel.innerHTML = renderOverview(detail)
@@ -487,6 +496,29 @@ function renderActivePanel() {
       panel.innerHTML = renderFilesPanel(detail)
       break
   }
+  if (fileListTop !== null) {
+    const nextList = panel.querySelector('.file-list')
+    if (nextList !== null) nextList.scrollTop = fileListTop
+  }
+  if (previewTop !== null) {
+    const nextPreview = panel.querySelector('#file-view .md-body, #file-view pre, #file-view .journal-list')
+    if (nextPreview !== null) nextPreview.scrollTop = previewTop
+  }
+  if (window.scrollY !== pageY) window.scrollTo(0, pageY)
+}
+
+/**
+ * Replace just the preview pane, leaving the file list (and the page scroll)
+ * untouched. Opening a file must not rebuild the panel around it.
+ */
+function refreshFileView() {
+  const view = document.getElementById('file-view')
+  if (view === null) return false
+  view.innerHTML = fileViewHtml()
+  for (const button of document.querySelectorAll('.file-btn')) {
+    button.classList.toggle('active', button.dataset.path === state.file?.path)
+  }
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +536,7 @@ function renderOverview(detail) {
 
   const blockerHtml =
     summary.status !== 'active'
-      ? `<div class="empty-hint">任务已${summary.status === 'completed' ? '完成' : '停止'}，运行时不再参与完成判定。可以“继续并发送”在同一个任务中开启新一轮。</div>`
+      ? `<div class="empty-hint">任务已${summary.status === 'completed' ? '完成' : '停止'}，运行时不再参与完成判定。点击顶部“继续”即可在同一任务中开启新一轮，无需填写指令。</div>`
       : summary.activeWorkCount === 0
         ? `<div class="empty-hint">当前没有参与 work；空集合不会判定完成。点击“恢复工作”创建承接执行者，或继续等待原 work 恢复。</div>`
         : blockers === null
@@ -782,7 +814,129 @@ function workCard(work) {
       ${work.recoveredFresh === true ? '<span>已用新会话恢复</span>' : ''}
     </div>
     ${spawn}
+    <div class="work-actions">
+      <button class="btn small ghost" type="button" data-action="open-conversation" data-work="${esc(work.id)}">查看对话</button>
+    </div>
   </article>`
+}
+
+// ---------------------------------------------------------------------------
+// Executor conversation
+// ---------------------------------------------------------------------------
+
+let conversationTimer = null
+let conversationSignature = ''
+
+function stopConversationRefresh() {
+  if (conversationTimer !== null) clearInterval(conversationTimer)
+  conversationTimer = null
+  conversationSignature = ''
+}
+
+function conversationEntryHtml(entry) {
+  const time = `<span class="chat-time">${esc(fmtTime(entry.at))}</span>`
+  if (entry.role === 'status') {
+    const status = entry.status ?? {}
+    const text = status.kind === 'retry' ? `重试：${status.code ?? ''} ${status.message ?? ''}` : status.kind === 'error' ? `失败：${status.code ?? ''} ${status.message ?? ''}` : status.message ?? ''
+    return `<div class="chat-status ${esc(status.kind ?? '')}">${time}${esc(text)}</div>`
+  }
+  if (entry.role === 'tool') {
+    const tool = entry.tool ?? {}
+    if (tool.kind === 'call') {
+      return `<details class="chat-tool call">
+        <summary><span class="chat-tag">调用</span><code>${esc(tool.name ?? '')}</code>${time}</summary>
+        <pre>${esc(tool.arguments ?? '')}</pre>
+      </details>`
+    }
+    const body = entry.text ?? ''
+    const first = body.split(/\r?\n/).find((line) => line.trim().length > 0) ?? ''
+    return `<details class="chat-tool result">
+      <summary><span class="chat-tag">结果</span><span class="chat-preview">${esc(first.slice(0, 120))}</span>${tool.truncated ? '<span class="chat-tag warn">已截断</span>' : ''}${time}</summary>
+      <pre>${esc(body)}</pre>
+    </details>`
+  }
+  const roleLabel = entry.role === 'user' ? '输入' : '模型'
+  const thinking =
+    typeof entry.thinking === 'string' && entry.thinking.trim().length > 0
+      ? `<details class="chat-thinking"><summary>思考过程 · ${entry.thinking.length} 字符</summary><div class="chat-thinking-body">${esc(entry.thinking)}</div></details>`
+      : ''
+  const usage =
+    entry.usage !== undefined && (entry.usage.inputTokens !== undefined || entry.usage.outputTokens !== undefined)
+      ? `<span class="chat-usage">${entry.usage.inputTokens ?? '?'} in / ${entry.usage.outputTokens ?? '?'} out</span>`
+      : ''
+  return `<div class="chat-row ${esc(entry.role)}">
+    <div class="chat-head"><span class="chat-tag">${roleLabel}</span>${time}${usage}</div>
+    ${thinking}
+    <div class="chat-body md-body">${markdownHtml(entry.text ?? '')}</div>
+  </div>`
+}
+
+function renderConversation(conversation, options = {}) {
+  const list = document.getElementById('chat-list')
+  if (list === null) return
+  // Polling every few seconds must not rebuild an unchanged transcript: it
+  // would collapse the <details> the reader just opened and reset scroll.
+  const signature = `${conversation.entries.length}:${conversation.entries.at(-1)?.seq ?? 0}:${conversation.truncated}`
+  if (signature === conversationSignature && options.force !== true) return
+  conversationSignature = signature
+  const nearBottom = options.forceBottom === true || list.scrollHeight - list.scrollTop - list.clientHeight < 80
+  list.innerHTML = conversation.entries.length === 0
+    ? '<div class="empty-hint">这个执行者还没有产生对话。任务运行时启动后，第一条消息会出现在这里。</div>'
+    : conversation.entries.map(conversationEntryHtml).join('')
+  const meta = document.getElementById('chat-meta')
+  if (meta !== null) {
+    meta.textContent = `${conversation.entries.length} 条记录${conversation.truncated ? '（已截断，仅显示最近部分）' : ''} · 会话 ${conversation.sessionId}`
+  }
+  if (nearBottom) list.scrollTop = list.scrollHeight
+}
+
+async function loadConversation(workId, options = {}) {
+  if (state.currentId === null) return
+  try {
+    const payload = await api(
+      `/api/tasks/${encodeURIComponent(state.currentId)}/conversation?work=${encodeURIComponent(workId)}`,
+    )
+    if (document.getElementById('chat-list') === null) return
+    renderConversation(payload.conversation, options)
+  } catch (error) {
+    const list = document.getElementById('chat-list')
+    if (list !== null) list.innerHTML = `<div class="empty-hint">${esc(error.message || String(error))}</div>`
+  }
+}
+
+function openConversation(workId) {
+  if (state.currentId === null) return
+  stopConversationRefresh()
+  const root = $('#modal-root')
+  root.innerHTML = `<div class="modal-backdrop">
+    <div class="modal chat-modal" role="dialog" aria-modal="true" aria-label="${esc(workId)} 的对话">
+      <div class="modal-head">
+        <h3>${esc(workId)} 的对话</h3>
+        <span class="chat-meta" id="chat-meta"></span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" type="button" data-chat-refresh>刷新</button>
+        <button class="modal-close" type="button" data-chat-close aria-label="关闭">×</button>
+      </div>
+      <div class="chat-list" id="chat-list"><div class="empty-hint">加载中…</div></div>
+    </div>
+  </div>`
+  const close = () => {
+    stopConversationRefresh()
+    root.innerHTML = ''
+  }
+  root.querySelector('[data-chat-close]').addEventListener('click', close)
+  root.querySelector('.modal-backdrop').addEventListener('mousedown', (event) => {
+    if (event.target === root.querySelector('.modal-backdrop')) close()
+  })
+  root.querySelector('[data-chat-refresh]').addEventListener('click', () => void loadConversation(workId, { forceBottom: false, force: true }))
+  void loadConversation(workId, { forceBottom: true })
+  conversationTimer = setInterval(() => {
+    if (document.getElementById('chat-list') === null) {
+      stopConversationRefresh()
+      return
+    }
+    void loadConversation(workId)
+  }, 3000)
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1167,7 @@ function renderCommandsPanel(detail) {
           </div>
           <div class="command-actions"><button class="btn primary" type="button" data-action="send-command">发送命令</button></div>
         </article>`
-      : `<div class="empty-hint">任务已${summary.status === 'completed' ? '完成' : '停止'}，不能再用普通命令继续。请点击顶部“继续并发送”开启新的运行轮次；发现、证据、报告和仍有效的命令会保留，旧轮次表态不参与新轮次。</div>`
+      : `<div class="empty-hint">任务已${summary.status === 'completed' ? '完成' : '停止'}，不能再用普通命令继续。请点击顶部“继续”直接开启新一轮，或“继续并发送指令”附带一条任务级指令；发现、证据、报告和仍有效的命令会保留，旧轮次表态不参与新轮次。</div>`
   return `${composer}
     <div class="section-head"><div><h3>命令与投递状态</h3><span class="sub">${commands.length} 条 · 最新在前</span></div></div>
     <div class="command-list">${commandsListHtml(detail)}</div>`
@@ -1180,12 +1334,173 @@ function renderFilesPanel(detail) {
   </div>`
 }
 
+/**
+ * Minimal Markdown renderer for task documents (task.md / findings.md /
+ * report.md ...). Everything is HTML-escaped first, so the only tags in the
+ * output are the ones this function emits. Covers the subset the runtime and
+ * the executors actually write: headings, lists, tables, fenced code, quotes,
+ * rules and inline emphasis/links.
+ */
+function markdownHtml(source) {
+  const lines = String(source ?? '').split(/\r?\n/)
+  const out = []
+  let index = 0
+  let paragraph = []
+  let lists = [] // [{ tag, indent }]
+
+  const inline = (text) => {
+    let s = esc(text)
+    s = s.replace(/`([^`]+)`/g, (_m, code) => `<code>${code}</code>`)
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    s = s.replace(
+      /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>',
+    )
+    s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noreferrer noopener">$2</a>')
+    return s
+  }
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return
+    out.push(`<p>${paragraph.map(inline).join('<br>')}</p>`)
+    paragraph = []
+  }
+  const closeLists = (toIndent) => {
+    while (lists.length > 0 && lists[lists.length - 1].indent >= toIndent) {
+      out.push(`</li></${lists.pop().tag}>`)
+    }
+  }
+  const closeAllLists = () => closeLists(-1)
+
+  const splitRow = (line) =>
+    line
+      .trim()
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map((cell) => cell.trim())
+
+  while (index < lines.length) {
+    const line = lines[index]
+    const trimmed = line.trim()
+
+    // Fenced code block
+    const fence = /^```(\w*)\s*$/.exec(trimmed)
+    if (fence !== null) {
+      flushParagraph()
+      closeAllLists()
+      const body = []
+      index += 1
+      while (index < lines.length && !/^```/.test(lines[index].trim())) {
+        body.push(lines[index])
+        index += 1
+      }
+      index += 1
+      const lang = fence[1].length > 0 ? ` data-lang="${esc(fence[1])}"` : ''
+      out.push(`<pre class="md-code"${lang}><code>${esc(body.join('\n'))}</code></pre>`)
+      continue
+    }
+
+    // Blank line
+    if (trimmed.length === 0) {
+      flushParagraph()
+      closeAllLists()
+      index += 1
+      continue
+    }
+
+    // Horizontal rule
+    if (/^(---+|\*\*\*+|___+)$/.test(trimmed)) {
+      flushParagraph()
+      closeAllLists()
+      out.push('<hr>')
+      index += 1
+      continue
+    }
+
+    // Heading
+    const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed)
+    if (heading !== null) {
+      flushParagraph()
+      closeAllLists()
+      const level = heading[1].length
+      out.push(`<h${level}>${inline(heading[2].replace(/\s+#+$/, ''))}</h${level}>`)
+      index += 1
+      continue
+    }
+
+    // Table: header row followed by a separator row (`| --- | :--: |`).
+    const separator = index + 1 < lines.length ? lines[index + 1].trim() : ''
+    if (trimmed.startsWith('|') && /^[\s:|-]+$/.test(separator) && separator.includes('-')) {
+      flushParagraph()
+      closeAllLists()
+      const header = splitRow(line)
+      index += 2
+      const rows = []
+      while (index < lines.length && lines[index].trim().startsWith('|')) {
+        rows.push(splitRow(lines[index]))
+        index += 1
+      }
+      const head = header.map((cell) => `<th>${inline(cell)}</th>`).join('')
+      const body = rows
+        .map((row) => `<tr>${row.map((cell) => `<td>${inline(cell)}</td>`).join('')}</tr>`)
+        .join('')
+      out.push(`<div class="md-table"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`)
+      continue
+    }
+
+    // Blockquote
+    if (trimmed.startsWith('>')) {
+      flushParagraph()
+      closeAllLists()
+      const quoted = []
+      while (index < lines.length && lines[index].trim().startsWith('>')) {
+        quoted.push(lines[index].trim().replace(/^>\s?/, ''))
+        index += 1
+      }
+      out.push(`<blockquote>${quoted.map(inline).join('<br>')}</blockquote>`)
+      continue
+    }
+
+    // List item (nested by indentation)
+    const item = /^(\s*)([-*+]|\d+\.)\s+(.*)$/.exec(line)
+    if (item !== null) {
+      flushParagraph()
+      const indent = item[1].replace(/\t/g, '  ').length
+      const tag = /\d/.test(item[2]) ? 'ol' : 'ul'
+      while (lists.length > 0 && lists[lists.length - 1].indent > indent) {
+        out.push(`</li></${lists.pop().tag}>`)
+      }
+      const top = lists[lists.length - 1]
+      if (top === undefined || top.indent < indent) {
+        lists.push({ tag, indent })
+        out.push(`<${tag}><li>${inline(item[3])}`)
+      } else {
+        out.push(`</li><li>${inline(item[3])}`)
+      }
+      index += 1
+      continue
+    }
+
+    // Paragraph text
+    closeAllLists()
+    paragraph.push(trimmed)
+    index += 1
+  }
+
+  flushParagraph()
+  closeAllLists()
+  return out.join('\n')
+}
+
 function fileViewHtml() {
   const file = state.file
   if (file === null) {
     return `<div class="empty-hint" style="margin:16px">从左侧选择一个文件。</div>`
   }
   const journal = file.path.endsWith('journal.jsonl')
+  const markdown = /\.(md|markdown)$/i.test(file.path)
   return `<div class="file-view-head">
       <span class="p">${esc(file.path)}</span>
       ${chip(formatBytes(file.size), 'gray')}
@@ -1193,7 +1508,7 @@ function fileViewHtml() {
       <span class="spacer"></span>
       <button class="btn small ghost" type="button" data-action="copy-file">复制</button>
     </div>
-    ${journal ? journalHtml(file.text) : `<pre>${esc(file.text)}</pre>`}`
+    ${journal ? journalHtml(file.text) : markdown ? `<div class="md-body">${markdownHtml(file.text)}</div>` : `<pre>${esc(file.text)}</pre>`}`
 }
 
 function journalHtml(text) {
@@ -1236,7 +1551,8 @@ async function openFile(path, options = {}) {
     state.file = payload.file
     if (state.tab !== 'files') {
       setTab('files')
-    } else if (state.detail !== null) {
+    } else if (!refreshFileView() && state.detail !== null) {
+      // Panel not on screen yet (or replaced since): fall back to a full render.
       renderActivePanel()
     }
   } catch (error) {
@@ -1412,9 +1728,9 @@ function openContinueModal() {
   const summary = detail.summary
   const ended = summary.status === 'completed' ? '已完成' : '已停止'
   openModal({
-    title: '继续并发送',
+    title: '继续并发送指令',
     confirmText: '开启新一轮',
-    bodyHtml: `<div class="modal-note">任务${ended}。继续会在同一个任务 ID 下开启新的运行轮次：保留发现、证据、当前报告和仍有效的用户要求；上一轮的终态、完成记录和表态不会被修改，也不参与新轮次的完成判定。这条文本会作为任务级命令交给本轮执行者。</div>
+    bodyHtml: `<div class="modal-note">任务${ended}。继续会在同一个任务 ID 下开启新的运行轮次：保留发现、证据、当前报告和仍有效的用户要求；上一轮的终态、完成记录和表态不会被修改，也不参与新轮次的完成判定。这条文本会作为任务级命令交给本轮执行者。只想让任务自己接着跑、不需要附加指令时，直接点顶部的“继续”。</div>
       <div class="field"><span>新的指令 <span class="hint">必填</span></span>
         <textarea id="continue-text" style="min-height:180px" placeholder="例如：基于现有报告补充利用链验证，并给出可复现证据。"></textarea></div>
       <div class="modal-note">当前 ${esc(summary.runId ?? '')}（累计 ${summary.runCount ?? 1} 轮），目标版本 v${summary.targetVersion}；继续本身不修改终点版本。</div>`,
@@ -1447,6 +1763,19 @@ async function recoverTask() {
   const result = payload.result ?? {}
   toast(String(result.text ?? '恢复请求已提交').split('\n')[0], 'ok')
   if (result.startError !== undefined) toast(`承接 work 已创建，但启动失败：${result.startError}`, 'err')
+  await loadDetail(state.currentId, { preserveScroll: true })
+  await loadTasks()
+}
+
+/** Restart a stopped task without inventing a command for the executor. */
+async function resumeTask() {
+  const payload = await api(`/api/tasks/${encodeURIComponent(state.currentId)}/resume`, {
+    method: 'POST',
+    body: { requestId: newRequestId('resume') },
+  })
+  const result = payload.result ?? {}
+  toast(String(result.text ?? '任务已重启').split('\n')[0], 'ok')
+  if (result.startError !== undefined) toast(`新一轮已提交，但启动失败：${result.startError}`, 'err')
   await loadDetail(state.currentId, { preserveScroll: true })
   await loadTasks()
 }
@@ -1499,6 +1828,9 @@ document.addEventListener('click', (event) => {
       case 'continue':
         openContinueModal()
         break
+      case 'resume':
+        void resumeTask().catch((error) => toast(error.message, 'err'))
+        break
       case 'recover':
         void recoverTask().catch((error) => toast(error.message, 'err'))
         break
@@ -1516,6 +1848,9 @@ document.addEventListener('click', (event) => {
         break
       case 'open-file':
         void openFile(target.dataset.path)
+        break
+      case 'open-conversation':
+        openConversation(target.dataset.work)
         break
       case 'copy-file':
         void copyCurrentFile()

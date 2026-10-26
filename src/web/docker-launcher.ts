@@ -194,12 +194,31 @@ export interface TaskServiceOptions {
   environment: NodeJS.ProcessEnv
 }
 
+/**
+ * Keys that carry the model configuration. They are removed from the inherited
+ * process environment before the Task service is rendered, so that settings
+ * saved in the Web UI win over the environment - including when the UI clears a
+ * value on purpose. The launcher then writes back the effective values.
+ */
+const MODEL_ENV_KEYS = [
+  'DEEPSEEK_API_KEY',
+  'LIEBIAN_API_KEY',
+  'DEEPSEEK_BASE_URL',
+  'LIEBIAN_BASE_URL',
+  'LIEBIAN_PROVIDER',
+  'LIEBIAN_MODEL',
+] as const
+
 /** Environment values worth forwarding to the Task container. */
 const PASSTHROUGH_ENV = [
   'DEEPSEEK_API_KEY',
+  'LIEBIAN_API_KEY',
   'DEEPSEEK_BASE_URL',
+  'LIEBIAN_BASE_URL',
   'LIEBIAN_PROVIDER',
   'LIEBIAN_MODEL',
+  'LIEBIAN_MODEL_MAX_TOKENS',
+  'LIEBIAN_MODEL_THINKING',
   'LIEBIAN_MODEL_CONCURRENCY',
   'LIEBIAN_MODEL_STREAM_IDLE_MS',
   'LIEBIAN_DIAGNOSTICS_INTERVAL_MS',
@@ -457,11 +476,23 @@ export async function startDockerTask(paths: TaskPaths, logger?: Logger): Promis
   await mkdir(paths.logsDir, { recursive: true })
   const settings = await effectiveWebSettings(paths.tasksRoot)
   const containerEnv: NodeJS.ProcessEnv = { ...process.env }
-  if (settings.apiKey.length > 0) containerEnv.DEEPSEEK_API_KEY = settings.apiKey
+  // Start from a clean slate: inherited values must not survive a value that the
+  // Web UI deliberately cleared. Then write the effective configuration back,
+  // under both the provider-neutral and the legacy DeepSeek names.
+  for (const key of MODEL_ENV_KEYS) delete containerEnv[key]
+  if (settings.apiKey.length > 0) {
+    containerEnv.DEEPSEEK_API_KEY = settings.apiKey
+    containerEnv.LIEBIAN_API_KEY = settings.apiKey
+  }
   if (settings.provider.length > 0) containerEnv.LIEBIAN_PROVIDER = settings.provider
   if (settings.model.length > 0) containerEnv.LIEBIAN_MODEL = settings.model
-  if (settings.baseUrl.length > 0) containerEnv.DEEPSEEK_BASE_URL = settings.baseUrl
+  if (settings.baseUrl.length > 0) {
+    containerEnv.DEEPSEEK_BASE_URL = settings.baseUrl
+    containerEnv.LIEBIAN_BASE_URL = settings.baseUrl
+  }
   containerEnv.LIEBIAN_MODEL_CONCURRENCY = String(settings.modelConcurrency)
+  containerEnv.LIEBIAN_MODEL_MAX_TOKENS = String(settings.modelMaxTokens)
+  containerEnv.LIEBIAN_MODEL_THINKING = settings.modelThinking
 
   const home = dshHome(paths)
   await mkdir(home, { recursive: true })

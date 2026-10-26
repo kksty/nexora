@@ -1,0 +1,32 @@
+#!/bin/sh
+# curl with an automatic fallback for peers that still require legacy TLS
+# renegotiation.
+#
+# OpenSSL 3 refuses legacy renegotiation by default, which makes curl fail with
+# exit code 35 before a single byte of the request is sent. Rather than weaken
+# TLS for every connection, the first attempt runs with the normal
+# configuration; only when it fails with an SSL connect error (or names legacy
+# renegotiation) is it repeated with /etc/ssl/openssl-legacy.cnf.
+#
+# The retry also covers a caller-supplied OPENSSL_CONF that is itself broken:
+# hand-rolled configs are the most common reason a target stays unreachable, and
+# silently falling back to the known-good file is better than leaving the caller
+# to debug OpenSSL.
+#
+# Retrying is safe here because a handshake failure means no request reached the
+# server, so nothing is submitted twice.
+set -u
+
+stderr_file=$(mktemp 2>/dev/null || echo /tmp/liebian-curl.$$)
+trap 'rm -f "$stderr_file"' EXIT INT TERM
+
+/usr/bin/curl "$@" 2>"$stderr_file"
+status=$?
+
+if [ "$status" -eq 35 ] || grep -qi 'legacy renegotiation' "$stderr_file" 2>/dev/null; then
+  echo 'curl: retrying with UnsafeLegacyRenegotiation (TLS connect failed; peer needs legacy renegotiation)' >&2
+  exec env OPENSSL_CONF=/etc/ssl/openssl-legacy.cnf /usr/bin/curl "$@"
+fi
+
+cat "$stderr_file" >&2
+exit "$status"

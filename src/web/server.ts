@@ -25,6 +25,7 @@ import {
   listTasks,
   readTaskFile,
   recoverTaskFromWeb,
+  resumeTaskFromWeb,
   sendCommandFromWeb,
   setEndFromWeb,
   setStartFromWeb,
@@ -33,8 +34,18 @@ import {
 } from './task-service.ts'
 import { reconcileTaskServices } from './docker-launcher.ts'
 import { parseModelConcurrency } from '../util/semaphore.ts'
+import { parseModelMaxTokens, parseModelThinking } from '../util/model-limits.ts'
+import { readWorkConversation } from './conversation.ts'
 import { DEFAULT_WEB_PORT, parsePort } from '../util/ports.ts'
-import { loadWebSettings, publicWebSettings, saveWebSettings } from './settings.ts'
+import {
+  ENV_MODEL,
+  ENV_PROVIDER,
+  clearWebSettings,
+  envText,
+  publicWebSettings,
+  resolveWebSettings,
+  saveWebSettings,
+} from './settings.ts'
 import { listModelConfig, testModelConfig } from './model-test.ts'
 
 export interface WebServerOptions {
@@ -425,28 +436,45 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         })
         return
       }
-      if (pathname === '/api/settings' && (method === 'GET' || method === 'POST')) {
+      if (pathname === '/api/settings' && (method === 'GET' || method === 'POST' || method === 'DELETE')) {
         if (method === 'GET') {
-          sendJson(response, 200, { ok: true, settings: publicWebSettings(await loadWebSettings(tasksRoot)) })
+          sendJson(response, 200, { ok: true, settings: publicWebSettings(await resolveWebSettings(tasksRoot)) })
           return
         }
         requireMutation(request, port, allowedOrigins)
+        if (method === 'DELETE') {
+          // Drop the saved override so the environment (LIEBIAN_* / DEEPSEEK_*)
+          // becomes effective again.
+          await clearWebSettings(tasksRoot)
+          sendJson(response, 200, { ok: true, settings: publicWebSettings(await resolveWebSettings(tasksRoot)) })
+          return
+        }
         const body = await readJsonBody(request)
-        const current = await loadWebSettings(tasksRoot)
-        const next = { ...current }
+        const current = await resolveWebSettings(tasksRoot)
+        const next = { ...current.settings }
         if (typeof body.apiKey === 'string' && body.apiKey.trim().length > 0) {
           if (body.apiKey.trim().length > 4096) throw new AppError('INVALID_ARGUMENT', 'API Key 过长')
           next.apiKey = body.apiKey.trim()
         }
         if (body.clearApiKey === true) next.apiKey = ''
-        if (typeof body.provider === 'string') next.provider = body.provider.trim() || 'deepseek-official'
-        if (typeof body.model === 'string') next.model = body.model.trim() || 'deepseek-flash'
+        if (typeof body.provider === 'string') {
+          next.provider = body.provider.trim() || envText(ENV_PROVIDER) || 'deepseek-official'
+        }
+        if (typeof body.model === 'string') {
+          next.model = body.model.trim() || envText(ENV_MODEL) || 'deepseek-flash'
+        }
         if (typeof body.baseUrl === 'string') next.baseUrl = body.baseUrl.trim()
         if (body.modelConcurrency !== undefined) {
           next.modelConcurrency = parseModelConcurrency(body.modelConcurrency)
         }
+        if (body.modelMaxTokens !== undefined) {
+          next.modelMaxTokens = parseModelMaxTokens(body.modelMaxTokens)
+        }
+        if (body.modelThinking !== undefined) {
+          next.modelThinking = parseModelThinking(body.modelThinking)
+        }
         await saveWebSettings(tasksRoot, next)
-        sendJson(response, 200, { ok: true, settings: publicWebSettings(next) })
+        sendJson(response, 200, { ok: true, settings: publicWebSettings(await resolveWebSettings(tasksRoot)) })
         return
       }
       if (pathname === '/api/settings/test' && method === 'POST') {
@@ -499,7 +527,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         return
       }
 
-      const match = /^\/api\/tasks\/([^/]+)(?:\/(events|run|stop|end-info|start-info|command|continue|recover|file))?$/.exec(
+      const match = /^\/api\/tasks\/([^/]+)(?:\/(events|run|stop|end-info|start-info|command|continue|resume|recover|file|conversation))?$/.exec(
         pathname,
       )
       if (match !== null) {
@@ -521,6 +549,15 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
           const exists = await stat(paths.stateFile).catch(() => null)
           if (exists === null) throw new AppError('TASK_NOT_FOUND', `找不到任务：${taskId}`)
           sendJson(response, 200, { ok: true, file: await readTaskFile(paths, filePath) })
+          return
+        }
+        if (method === 'GET' && action === 'conversation') {
+          const workId = url.searchParams.get('work') ?? ''
+          if (workId.length === 0) throw new AppError('INVALID_ARGUMENT', '缺少 work')
+          const paths = makeTaskPaths(tasksRoot, taskId)
+          const exists = await stat(paths.stateFile).catch(() => null)
+          if (exists === null) throw new AppError('TASK_NOT_FOUND', `找不到任务：${taskId}`)
+          sendJson(response, 200, { ok: true, conversation: await readWorkConversation(paths, workId) })
           return
         }
         if (method === 'GET' && action === 'events') {
@@ -567,6 +604,12 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
             sendJson(response, 200, { ok: true, result })
             return
           }
+          if (action === 'resume') {
+            const requestId = typeof body.requestId === 'string' ? body.requestId : ''
+            const result = await resumeTaskFromWeb(tasksRoot, taskId, requestId)
+            sendJson(response, 200, { ok: true, result })
+            return
+          }
           if (action === 'recover') {
             const requestId = typeof body.requestId === 'string' ? body.requestId : ''
             const result = await recoverTaskFromWeb(tasksRoot, taskId, requestId)
@@ -579,7 +622,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     } catch (error) {
       const payload = errorPayload(error)
       const status =
-        payload.code === 'TASK_NOT_FOUND' || payload.code === 'FILE_NOT_FOUND'
+        payload.code === 'TASK_NOT_FOUND' || payload.code === 'FILE_NOT_FOUND' || payload.code === 'WORK_NOT_FOUND'
           ? 404
           : payload.code === 'UNAUTHORIZED'
             ? 401

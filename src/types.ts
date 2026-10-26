@@ -142,6 +142,11 @@ export interface RunRecord {
   continueRequestId?: string
   /** The human instruction that started this run (continue only). */
   continueText?: string
+  /**
+   * Request id of a restart that reopened the task without a human command.
+   * Such a run has no command record: the executor resumes from shared state.
+   */
+  resumeRequestId?: string
   /** Idempotent manual recovery operations performed inside this run. */
   recoveries: { requestId: string; workId: string; at: string }[]
   /**

@@ -3,12 +3,36 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { Client } from '@modelcontextprotocol/client'
-import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
+import type { Client } from '@modelcontextprotocol/client'
 import { startApiServer, type ApiServer } from '../src/api/server.ts'
 import { daemonAlive } from '../src/core/daemon.ts'
 import { nullLogger } from '../src/util/log.ts'
 import { createHarness, type TestHarness } from './support/harness.ts'
+
+/**
+ * `@modelcontextprotocol/client` reaches us as a transitive dependency of the
+ * harness SDK, so it is absent in a checkout that has not run `npm install`.
+ * Importing it statically would abort this whole file, including the three API
+ * tests that do not need it; load it lazily and skip only the MCP cases.
+ */
+type McpDeps = {
+  Client: typeof import('@modelcontextprotocol/client').Client
+  StdioClientTransport: typeof import('@modelcontextprotocol/client/stdio').StdioClientTransport
+}
+
+const mcp = await (async (): Promise<McpDeps | null> => {
+  try {
+    const [client, stdio] = await Promise.all([
+      import('@modelcontextprotocol/client'),
+      import('@modelcontextprotocol/client/stdio'),
+    ])
+    return { Client: client.Client, StdioClientTransport: stdio.StdioClientTransport }
+  } catch {
+    return null
+  }
+})()
+
+const mcpTest = mcp === null ? test.skip : test
 
 const MCP_ENTRY = fileURLToPath(new URL('../src/mcp/main.ts', import.meta.url))
 
@@ -124,13 +148,14 @@ test('本地 API：请求体为 null 或必填参数类型错误时返回参数�
   assert.equal(numericReason.body.error?.code, 'INVALID_ARGUMENT')
 })
 
-test('MCP 桥接：harness 客户端可以发现并调用运行时工具', async (t) => {
+mcpTest('MCP 桥接：harness 客户端可以发现并调用运行时工具', async (t) => {
+  if (mcp === null) return
   const harness = await createHarness()
   t.after(() => harness.cleanup())
   const server = await startRuntime(harness)
   t.after(() => server.close())
 
-  const transport = new StdioClientTransport({
+  const transport = new mcp.StdioClientTransport({
     command: process.execPath,
     args: [MCP_ENTRY],
     env: {
@@ -141,7 +166,7 @@ test('MCP 桥接：harness 客户端可以发现并调用运行时工具', async
     } as Record<string, string>,
     stderr: 'pipe',
   })
-  const client = new Client(
+  const client = new mcp.Client(
     { name: 'liebian-test-client', version: '0.0.1' },
     { capabilities: {}, versionNegotiation: { mode: 'auto' } },
   )
@@ -207,14 +232,15 @@ test('MCP 桥接：harness 客户端可以发现并调用运行时工具', async
   assert.match(reportText, /版本：r1/)
 })
 
-test('MCP 工具：裂变、通信、等待与共识闭环', async (t) => {
+mcpTest('MCP 工具：裂变、通信、等待与共识闭环', async (t) => {
+  if (mcp === null) return
   const harness = await createHarness()
   t.after(() => harness.cleanup())
   const server = await startRuntime(harness)
   t.after(() => server.close())
 
   const connect = async (work: string): Promise<Client> => {
-    const transport = new StdioClientTransport({
+    const transport = new mcp.StdioClientTransport({
       command: process.execPath,
       args: [MCP_ENTRY],
       env: {
@@ -225,7 +251,7 @@ test('MCP 工具：裂变、通信、等待与共识闭环', async (t) => {
       } as Record<string, string>,
       stderr: 'pipe',
     })
-    const client = new Client(
+    const client = new mcp.Client(
       { name: `liebian-test-${work}`, version: '0.0.1' },
       { capabilities: {}, versionNegotiation: { mode: 'auto' } },
     )

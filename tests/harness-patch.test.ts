@@ -47,3 +47,53 @@ test('harness patch 固定使用 bash 并精简模型工具面', () => {
   assert.match(yaml, /LIEBIAN_DAEMON_URL/)
   assert.match(yaml, /LIEBIAN_DAEMON_TOKEN/)
 })
+
+test('harness patch 限制单次响应输出上限，避免网关静默返回空回复', () => {
+  const paths = makeTaskPaths(fileURLToPath(new URL('../.scratch', import.meta.url)), 'T-20261021-120000-abcd')
+  const render = (): string =>
+    renderHarnessPatch({ paths, mcpEntry: '/app/src/mcp/main.ts', nodeExecutable: '/usr/local/bin/node' })
+
+  const previous = process.env.LIEBIAN_MODEL_MAX_TOKENS
+  try {
+    delete process.env.LIEBIAN_MODEL_MAX_TOKENS
+    assert.match(render(), /- id: llm-deepseek\n  config:\n    maxTokens: 32000\n/)
+
+    process.env.LIEBIAN_MODEL_MAX_TOKENS = '4096'
+    assert.match(render(), /- id: llm-deepseek\n  config:\n    maxTokens: 4096\n/)
+
+    // A malformed value must not leak into the patch.
+    process.env.LIEBIAN_MODEL_MAX_TOKENS = 'abc'
+    assert.match(render(), /- id: llm-deepseek\n  config:\n    maxTokens: 32000\n/)
+  } finally {
+    if (previous === undefined) delete process.env.LIEBIAN_MODEL_MAX_TOKENS
+    else process.env.LIEBIAN_MODEL_MAX_TOKENS = previous
+  }
+})
+
+test('harness patch 把思考强度映射为 thinking 与 reasoningEffort', () => {
+  const paths = makeTaskPaths(fileURLToPath(new URL('../.scratch', import.meta.url)), 'T-20261021-120000-abcd')
+  const render = (): string =>
+    renderHarnessPatch({ paths, mcpEntry: '/app/src/mcp/main.ts', nodeExecutable: '/usr/local/bin/node' })
+
+  const previous = process.env.LIEBIAN_MODEL_THINKING
+  try {
+    delete process.env.LIEBIAN_MODEL_THINKING
+    assert.match(render(), /thinking: enabled\n    reasoningEffort: high/)
+
+    process.env.LIEBIAN_MODEL_THINKING = 'off'
+    assert.match(render(), /thinking: disabled\n    reasoningEffort: off/)
+
+    process.env.LIEBIAN_MODEL_THINKING = 'low'
+    assert.match(render(), /thinking: enabled\n    reasoningEffort: low/)
+
+    process.env.LIEBIAN_MODEL_THINKING = 'max'
+    assert.match(render(), /thinking: enabled\n    reasoningEffort: max/)
+
+    // Unsupported values fall back to the default instead of breaking the patch.
+    process.env.LIEBIAN_MODEL_THINKING = 'turbo'
+    assert.match(render(), /thinking: enabled\n    reasoningEffort: high/)
+  } finally {
+    if (previous === undefined) delete process.env.LIEBIAN_MODEL_THINKING
+    else process.env.LIEBIAN_MODEL_THINKING = previous
+  }
+})

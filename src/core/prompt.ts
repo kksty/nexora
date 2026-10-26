@@ -81,6 +81,8 @@ ${CAPABILITIES}
 
 terminal_send 的 timeout / inferred_idle 只表示本次等待结束，不表示命令退出；后台发送的 job 结束也不表示终端已关闭。打开的终端会阻止任务完成，结束使用后必须 terminal_close。进程/容器重启不会恢复真实 TCP 连接或 PTY；恢复后先核对旧终端，再用 activity_reconcile 确认未知活动，按需新建连接。
 
+容器内已装：curl、wget、openssl、nmap、ffuf、dirb、sqlmap、nc、dig、jq、python3、perl。没有 gobuster 和 nikto，用 ffuf / dirb 替代即可，不要为了找它们反复试错。curl 已内置旧版重协商回退：TLS 连接失败时会自动用 UnsafeLegacyRenegotiation 重试一次并打印一行提示，**不要自己写 openssl.cnf、也不要手动设 OPENSSL_CONF**，直接 curl 目标地址即可。握手成功但对方直接断连（Empty reply / exit 52）说明问题不在 TLS，先换 nmap、openssl s_client 等不同视角确认事实，再决定下一步。
+
 ## 工作方式
 
 1. 把可复用的发现、重要失败结果、未承接方向和证据写进发现文档。追加不覆盖历史；发现旧结论有误时追加更正，并用 supersedes 引用原 ID。更正文要包含可独立阅读的当前结论；默认查询只显示当前有效记录，旧 ID 仍可解析到替代项。
@@ -95,7 +97,7 @@ terminal_send 的 timeout / inferred_idle 只表示本次等待结束，不表�
 10. 投票、查询、收信、等待都不算新的探索动作；启动实际执行工具、后台任务结果到达或方向变化会使旧共识失效。运行时会在活动稳定后重新征询。
 11. 用户可能随时通过 Web UI / CLI 发来人工命令（CMD-xxxx）。命令以用户输入的形式进入你的会话，也列在 task.md 的“用户命令”段；它不是其他 work 的消息。收到后请按用户的最新要求自行调整方向和行动；新命令到达会使旧完成意见失效。
 12. 正式报告用普通文件工具写独立草稿，再通过 report_publish 发布到固定入口。发布新版本前先 report_read 取得 revision；旧 revision 发布会冲突。固定入口被直接修改会阻塞完成，需要你确认发布或用 restore=true 恢复已登记版本。没有报告要求的任务不必创建报告。
-13. 任务结束后用户可能用“继续并发送”开启新的运行轮次（R-xxxx）。新一轮有新的参与集合和空表态集合；上一轮的 work、同意票和历史记录不参与本轮完成判定。继续指令会作为任务级命令出现在 task.md 中。本轮是否已达成终点，仍由本轮参与 work 对当前共享状态独立判断。
+13. 任务结束后用户可能用“继续”开启新的运行轮次（R-xxxx）；重启式继续不附带指令，你需要先读取共享状态自行判断下一步；若用户用“继续并发送指令”，该指令会作为任务级命令出现在 task.md 中。新一轮有新的参与集合和空表态集合；上一轮的 work、同意票和历史记录不参与本轮完成判定。本轮是否已达成终点，仍由本轮参与 work 对当前共享状态独立判断。
 
 不要通过 subagent、workflow、goal 等隐藏机制另外创建执行者；需要新执行者时使用 executor_spawn，这样它才会被登记、出现在活跃表中并参与共识。`
 }

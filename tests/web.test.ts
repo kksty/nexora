@@ -304,6 +304,8 @@ test('Web UI：API 配置保存、清除且不回显 key', async (t) => {
     model: 'custom-model',
     baseUrl: 'https://example.test/v1',
     modelConcurrency: 6,
+    modelMaxTokens: 4096,
+    modelThinking: 'low',
   })
   assert.equal(saved.status, 200)
   assert.equal(saved.body.settings.apiKeySet, true)
@@ -311,6 +313,10 @@ test('Web UI：API 配置保存、清除且不回显 key', async (t) => {
   assert.equal(saved.body.settings.model, 'custom-model')
   assert.equal(saved.body.settings.baseUrl, 'https://example.test/v1')
   assert.equal(saved.body.settings.modelConcurrency, 6)
+  assert.equal(saved.body.settings.modelMaxTokens, 4096)
+  assert.equal(saved.body.settings.modelThinking, 'low')
+  assert.equal(saved.body.settings.sources.modelMaxTokens, 'saved')
+  assert.equal(saved.body.settings.sources.modelThinking, 'saved')
   assert.equal(Object.prototype.hasOwnProperty.call(saved.body.settings, 'apiKey'), false)
 
   const invalid = await post(server, '/api/settings', { modelConcurrency: 0 })
@@ -325,6 +331,98 @@ test('Web UI：API 配置保存、清除且不回显 key', async (t) => {
   assert.equal(cleared.body.settings.apiKeySet, false)
   const afterClear = JSON.parse(await readFile(join(tasksRoot, '.web-settings.json'), 'utf8')) as { apiKey: string }
   assert.equal(afterClear.apiKey, '')
+})
+
+test('Web UI：环境变量可配置任意 provider，且前端保存后覆盖它、删除后回退', async (t) => {
+  const previous = {
+    apiKey: process.env.LIEBIAN_API_KEY,
+    legacyKey: process.env.DEEPSEEK_API_KEY,
+    baseUrl: process.env.LIEBIAN_BASE_URL,
+    legacyBaseUrl: process.env.DEEPSEEK_BASE_URL,
+    provider: process.env.LIEBIAN_PROVIDER,
+    model: process.env.LIEBIAN_MODEL,
+  }
+  process.env.LIEBIAN_API_KEY = 'sk-env-gateway'
+  process.env.LIEBIAN_BASE_URL = 'http://192.168.1.10:8080/v1'
+  process.env.LIEBIAN_PROVIDER = 'pai'
+  process.env.LIEBIAN_MODEL = 'qwen3.8-27b'
+  delete process.env.DEEPSEEK_API_KEY
+  delete process.env.DEEPSEEK_BASE_URL
+  t.after(() => {
+    for (const [key, value] of [
+      ['LIEBIAN_API_KEY', previous.apiKey],
+      ['DEEPSEEK_API_KEY', previous.legacyKey],
+      ['LIEBIAN_BASE_URL', previous.baseUrl],
+      ['DEEPSEEK_BASE_URL', previous.legacyBaseUrl],
+      ['LIEBIAN_PROVIDER', previous.provider],
+      ['LIEBIAN_MODEL', previous.model],
+    ] as const) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+
+  const { tasksRoot, server } = await createWebHarness(t)
+
+  // 1. Nothing saved yet: every field is served straight from the environment,
+  //    including a provider name the code has never heard of.
+  const fromEnv = await fetch(`${server.url}/api/settings`, { headers: authHeaders() }).then((response) => response.json())
+  assert.equal((fromEnv as any).settings.provider, 'pai')
+  assert.equal((fromEnv as any).settings.model, 'qwen3.8-27b')
+  assert.equal((fromEnv as any).settings.baseUrl, 'http://192.168.1.10:8080/v1')
+  assert.equal((fromEnv as any).settings.apiKeySet, true)
+  assert.equal((fromEnv as any).settings.apiKeySource, 'environment')
+  assert.equal((fromEnv as any).settings.savedOverride, false)
+  assert.equal((fromEnv as any).settings.sources.baseUrl, 'environment')
+
+  // 2. Saving in the UI wins over the environment.
+  const saved = await post(server, '/api/settings', {
+    provider: 'openai-compatible',
+    model: 'glm-5',
+    baseUrl: 'http://10.0.0.5:8000/v1',
+    apiKey: 'sk-ui-key',
+  })
+  assert.equal(saved.status, 200)
+  assert.equal(saved.body.settings.provider, 'openai-compatible')
+  assert.equal(saved.body.settings.baseUrl, 'http://10.0.0.5:8000/v1')
+  assert.equal(saved.body.settings.apiKeySource, 'saved')
+  assert.equal(saved.body.settings.savedOverride, true)
+
+  const afterSave = await fetch(`${server.url}/api/settings`, { headers: authHeaders() }).then((response) => response.json())
+  assert.equal((afterSave as any).settings.baseUrl, 'http://10.0.0.5:8000/v1')
+  assert.equal((afterSave as any).settings.model, 'glm-5')
+
+  // 3. Deleting the saved override hands control back to the environment.
+  const reset = await fetch(`${server.url}/api/settings`, {
+    method: 'DELETE',
+    headers: { ...authHeaders(), 'x-liebian-web': '1' },
+  })
+  assert.equal(reset.status, 200)
+  const resetBody = (await reset.json()) as any
+  assert.equal(resetBody.settings.provider, 'pai')
+  assert.equal(resetBody.settings.baseUrl, 'http://192.168.1.10:8080/v1')
+  assert.equal(resetBody.settings.savedOverride, false)
+  await assert.rejects(readFile(join(tasksRoot, '.web-settings.json'), 'utf8'))
+})
+
+test('Web UI：保存的空值可以关闭环境变量提供的 Key 与 Base URL', async (t) => {
+  const previousKey = process.env.LIEBIAN_API_KEY
+  const previousBase = process.env.LIEBIAN_BASE_URL
+  process.env.LIEBIAN_API_KEY = 'sk-env-only'
+  process.env.LIEBIAN_BASE_URL = 'http://env.example/v1'
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.LIEBIAN_API_KEY
+    else process.env.LIEBIAN_API_KEY = previousKey
+    if (previousBase === undefined) delete process.env.LIEBIAN_BASE_URL
+    else process.env.LIEBIAN_BASE_URL = previousBase
+  })
+
+  const { server } = await createWebHarness(t)
+  const saved = await post(server, '/api/settings', { clearApiKey: true, baseUrl: '', provider: 'pai', model: 'm' })
+  assert.equal(saved.status, 200)
+  assert.equal(saved.body.settings.apiKeySet, false)
+  assert.equal(saved.body.settings.apiKeySource, 'none')
+  assert.equal(saved.body.settings.baseUrl, '')
 })
 
 test('Web UI：获取模型列表并检测模型连通性', async (t) => {
@@ -683,6 +781,42 @@ test('Web UI：已结束任务“继续并发送”创建新轮次且幂等', as
 
   // Missing request id is rejected before any state change.
   const missing = await post(server, `/api/tasks/${taskId}/continue`, { text: '缺少 ID' })
+  assert.equal(missing.status, 400)
+  assert.equal(missing.body.error.code, 'INVALID_ARGUMENT')
+})
+
+test('Web UI：已结束任务“继续”不开命令也能重启，且幂等', async (t) => {
+  const { tasksRoot, server } = await createWebHarness(t)
+  const taskId = await createTask(server)
+  const paths = makeTaskPaths(tasksRoot, taskId)
+  await finishTask(paths)
+
+  const resumed = await post(server, `/api/tasks/${taskId}/resume`, { requestId: 'web-resume-1' })
+  assert.equal(resumed.status, 200)
+  assert.equal(resumed.body.ok, true)
+  assert.equal(resumed.body.result.runId, 'R-0002')
+  assert.equal(resumed.body.result.workId, 'W-0002')
+  let state = await loadState(paths)
+  assert.equal(state.status, 'active')
+  assert.equal(state.currentRunId, 'R-0002')
+  // No command is recorded: the executor resumes from shared state alone.
+  assert.equal(state.commands.length, 0)
+  assert.equal(state.runs[1]?.resumeRequestId, 'web-resume-1')
+  assert.equal(state.runs[1]?.commandIds.length, 0)
+  assert.equal(state.works['W-0002']?.origin, 'continue')
+
+  const replay = await post(server, `/api/tasks/${taskId}/resume`, { requestId: 'web-resume-1' })
+  assert.equal(replay.status, 200)
+  assert.equal(replay.body.result.idempotent, true)
+  state = await loadState(paths)
+  assert.equal(state.runs.length, 2)
+
+  // An active task must not be reopened a second time.
+  const active = await post(server, `/api/tasks/${taskId}/resume`, { requestId: 'web-resume-2' })
+  assert.equal(active.status, 409)
+  assert.equal(active.body.error.code, 'TASK_ACTIVE')
+
+  const missing = await post(server, `/api/tasks/${taskId}/resume`, {})
   assert.equal(missing.status, 400)
   assert.equal(missing.body.error.code, 'INVALID_ARGUMENT')
 })

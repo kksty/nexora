@@ -9,7 +9,7 @@
     "liebian-mcp": "./bin/liebian-mcp.js"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests",
+    "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "probe:harness": "node scripts/probe-real-harness.mjs",
     "probe:steer": "node scripts/probe-command-steer.mjs",

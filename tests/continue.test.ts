@@ -341,3 +341,56 @@ test('完成提交后重启只补清理，不重新建立会话或再次探索',
   assert.equal(engine.state.runs[0]?.cleanup, 'done')
   assert.equal(engine.state.status, 'completed')
 })
+
+test('重启继续：不开命令也能开新一轮，执行者从共享状态自行继续', async (t) => {
+  const harness = await createHarness()
+  t.after(() => harness.cleanup())
+  await harness.engine.start()
+  await harness.engine.whenQuiet()
+  const finding = await harness.engine.appendFinding('W-0001', { text: '重启后仍然有效的共享发现' })
+  await completeTask(harness)
+  await harness.engine.close('completed')
+
+  const { engine, driver } = await reopen(harness)
+  t.after(() => engine.close('test-cleanup'))
+
+  const result = await engine.resumeTask({ requestId: 'resume-1', source: 'web' })
+  assert.equal(result.idempotent, false)
+  assert.equal(result.command, null, '重启继续不产生人工命令')
+  assert.equal(result.run.id, 'R-0002')
+  assert.equal(result.work.id, 'W-0002')
+
+  const state = engine.state
+  assert.equal(state.status, 'active')
+  assert.equal(state.currentRunId, 'R-0002')
+  assert.equal(state.runs.length, 2)
+  assert.equal(state.runs[1]?.status, 'active')
+  assert.equal(state.runs[1]?.resumeRequestId, 'resume-1')
+  assert.equal(state.runs[1]?.continueRequestId, undefined)
+  assert.equal(state.runs[1]?.commandIds.length, 0)
+  // No command was recorded, and shared material survived the restart.
+  assert.equal(state.commands.length, 0)
+  assert.equal(state.findings[0]?.id, finding.id)
+  assert.equal(state.works['W-0002']?.runId, 'R-0002')
+  assert.equal(state.completion, null)
+
+  assert.equal(await engine.whenQuiet(), true)
+  const prompt = driver.lastPrompt('W-0002')
+  assert.match(prompt, /R-0002/)
+  assert.match(prompt, /不参与本轮共识/)
+
+  // Replaying the same request returns the same run instead of opening another.
+  const again = await engine.resumeTask({ requestId: 'resume-1', source: 'web' })
+  assert.equal(again.idempotent, true)
+  assert.equal(again.run.id, 'R-0002')
+  assert.equal(engine.state.runs.length, 2)
+})
+
+test('重启继续：任务仍在进行时拒绝，避免开出第二个写入者', async (t) => {
+  const harness = await createHarness()
+  t.after(() => harness.cleanup())
+  await harness.engine.start()
+  await harness.engine.whenQuiet()
+
+  await assert.rejects(() => harness.engine.resumeTask({ requestId: 'resume-active', source: 'web' }), /正在进行中/)
+})

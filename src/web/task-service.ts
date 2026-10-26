@@ -654,7 +654,7 @@ export async function sendCommandFromWeb(  tasksRoot: string,
   if (state.status !== 'active') {
     throw new AppError(
       'TASK_NOT_ACTIVE',
-      `任务已${state.status === 'completed' ? '完成' : '停止'}，命令未保存。请使用“继续并发送”开启新一轮。`,
+      `任务已${state.status === 'completed' ? '完成' : '停止'}，命令未保存。请使用“继续”开启新一轮，或用“继续并发送指令”附带一条指令。`,
     )
   }
   if (composeWebMode()) {
@@ -817,6 +817,89 @@ export interface RecoverWebResult extends ActionResult {
   startError?: string
 }
 
+export interface ResumeWebResult extends ActionResult {
+  runId: string
+  workId: string
+  idempotent: boolean
+  started: boolean
+  startError?: string
+}
+
+/**
+ * Restart a stopped task without asking the operator for a command.
+ *
+ * Same effect as "continue" (a fresh run with a successor work) minus the
+ * command record: the executor resumes from shared state on its own.
+ */
+export async function resumeTaskFromWeb(
+  tasksRoot: string,
+  taskId: string,
+  requestId: string,
+): Promise<ResumeWebResult> {
+  const trimmedRequestId = requestId.trim()
+  if (trimmedRequestId.length === 0) {
+    throw new AppError('INVALID_ARGUMENT', '缺少 requestId；客户端应为同一次提交复用同一个 ID')
+  }
+  const paths = makeTaskPaths(tasksRoot, taskId)
+  const before = await loadState(paths)
+  const previousRun = before.runs.find((run) => run.resumeRequestId === trimmedRequestId)
+  if (previousRun !== undefined) {
+    const work = previousRun.workIds.map((id) => before.works[id]).find((item) => item !== undefined)
+    if (work === undefined) {
+      throw new AppError('STATE_CORRUPT', `重启请求 ${trimmedRequestId} 的记录缺少 work`)
+    }
+    return {
+      text: `request ID 已提交过，返回原重启结果：轮次 ${previousRun.id}，work ${work.id}。未重复创建轮次。`,
+      online: false,
+      runId: previousRun.id,
+      workId: work.id,
+      idempotent: true,
+      started: false,
+    }
+  }
+  if (before.status === 'active') {
+    throw new AppError('TASK_ACTIVE', '任务正在进行中；无需重启，可直接发送命令。')
+  }
+  const info = await readDaemonInfo(paths)
+  if (info !== null && (await daemonAlive(info, 1_200))) {
+    throw new AppError('RUNTIME_STOPPING', '任务运行时仍在运行；请等它停止后，用同一 request ID 重试。')
+  }
+  if (composeWebMode()) {
+    const stopped = await stopDockerTaskContainer(paths)
+    if (stopped) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  }
+  const result = await withWebOwnership(paths, async (engine) => {
+    return engine.resumeTask({ requestId: trimmedRequestId, source: 'web' })
+  })
+  let started = false
+  let startError: string | undefined
+  if (composeWebMode()) {
+    try {
+      await startDockerTask(paths)
+      started = true
+    } catch (error) {
+      startError = describeError(error)
+    }
+  }
+  return {
+    text:
+      result.text +
+      (started
+        ? '\n任务运行时已启动。'
+        : composeWebMode()
+          ? `\n新一轮已提交，但启动运行时失败${startError === undefined ? '' : `：${startError}`}。可在任务页重试“启动运行时”。`
+          : '\n请通过 docker compose 或 Web UI 启动任务运行时。'),
+    online: started,
+    runId: result.run.id,
+    workId: result.work.id,
+    idempotent: result.idempotent,
+    started,
+    ...(startError === undefined ? {} : { startError }),
+  }
+}
+
 /**
  * Recover an active task with no participants by creating one takeover work.
  * If any participant still exists, no work is created ("优先恢复原有 work").
@@ -835,7 +918,7 @@ export async function recoverTaskFromWeb(
   if (state.status !== 'active') {
     throw new AppError(
       'TASK_NOT_ACTIVE',
-      `任务状态为 ${state.status}；恢复只用于进行中的任务，已结束任务请使用“继续并发送”。`,
+      `任务状态为 ${state.status}；恢复只用于进行中的任务，已结束任务请使用“继续”。`,
     )
   }
   const info = await readDaemonInfo(paths)

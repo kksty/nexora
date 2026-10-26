@@ -133,6 +133,66 @@ test('模型检测：缺少 key 或自定义 provider 缺少 Base URL 时给出�
   assert.match(custom.message, /Base URL/)
 })
 
+test('模型检测：非 deepseek-official 的 provider 只要配了 Base URL 就可用，且已保存配置覆盖环境变量', async (t) => {
+  const fake = await startModelServer(t, () => ({
+    status: 200,
+    body: { choices: [{ message: { content: 'gateway-ok' } }] },
+  }))
+  const tasksRoot = await createTasksRoot(t)
+  const previous = {
+    provider: process.env.LIEBIAN_PROVIDER,
+    model: process.env.LIEBIAN_MODEL,
+    baseUrl: process.env.LIEBIAN_BASE_URL,
+    apiKey: process.env.LIEBIAN_API_KEY,
+  }
+  process.env.LIEBIAN_PROVIDER = 'pai'
+  process.env.LIEBIAN_MODEL = 'qwen3.8-27b'
+  process.env.LIEBIAN_BASE_URL = 'http://env.invalid/v1'
+  process.env.LIEBIAN_API_KEY = 'sk-env'
+  t.after(() => {
+    for (const [key, value] of [
+      ['LIEBIAN_PROVIDER', previous.provider],
+      ['LIEBIAN_MODEL', previous.model],
+      ['LIEBIAN_BASE_URL', previous.baseUrl],
+      ['LIEBIAN_API_KEY', previous.apiKey],
+    ] as const) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+
+  // Environment-only: an arbitrary provider name resolves as long as a Base URL
+  // exists, and it is used instead of the built-in DeepSeek endpoint.
+  const fromEnv = await resolveModelConfig(tasksRoot, {})
+  assert.equal(fromEnv.ok, true)
+  assert.equal(fromEnv.ok && fromEnv.config.provider, 'pai')
+  assert.equal(fromEnv.ok && fromEnv.config.model, 'qwen3.8-27b')
+  assert.equal(fromEnv.ok && fromEnv.config.baseUrl, 'http://env.invalid/v1')
+
+  // Saved settings (the Web UI) win over the environment for every field.
+  await writeFile(
+    join(tasksRoot, '.web-settings.json'),
+    JSON.stringify({
+      apiKey: 'sk-saved',
+      provider: 'custom-gateway',
+      model: 'glm-5',
+      baseUrl: fake.url,
+      modelConcurrency: 4,
+    }),
+    'utf8',
+  )
+  const fromSaved = await resolveModelConfig(tasksRoot, {})
+  assert.equal(fromSaved.ok, true)
+  assert.equal(fromSaved.ok && fromSaved.config.provider, 'custom-gateway')
+  assert.equal(fromSaved.ok && fromSaved.config.model, 'glm-5')
+  assert.equal(fromSaved.ok && fromSaved.config.baseUrl, fake.url)
+
+  const result = await testModelConfig(tasksRoot, {})
+  assert.equal(result.success, true)
+  assert.equal(result.reply, 'gateway-ok')
+  assert.equal(fake.requests[0]?.authorization, 'Bearer sk-saved')
+})
+
 test('模型检测：未填写的字段回退到已保存配置', async (t) => {
   const fake = await startModelServer(t, () => ({
     status: 200,

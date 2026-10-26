@@ -9,6 +9,7 @@
 
 import { fileURLToPath } from 'node:url'
 import type { TaskPaths } from '../core/paths.ts'
+import { envModelMaxTokens, envModelThinking } from '../util/model-limits.ts'
 
 function yamlString(value: string): string {
   return JSON.stringify(value)
@@ -28,6 +29,18 @@ export interface HarnessPatchOptions {
   nodeExecutable: string
 }
 
+/**
+ * Upper bound for one model response.
+ *
+ * The SDK defaults this to the official DeepSeek ceiling (256000). Third-party
+ * OpenAI/Anthropic-compatible gateways frequently cap it far lower, and at least
+ * one of them answers an oversized `max_tokens` with an empty turn
+ * (`output_tokens: 0`, no content blocks) instead of an error - which the
+ * harness surfaces as EMPTY_RESPONSE, so the executor silently does nothing.
+ * The effective value comes from the Web UI settings or LIEBIAN_MODEL_MAX_TOKENS;
+ * see `src/util/model-limits.ts`.
+ */
+
 /** Render the YAML patch document. */
 export function renderHarnessPatch(options: HarnessPatchOptions): string {
   const { paths, mcpEntry, nodeExecutable } = options
@@ -40,6 +53,30 @@ export function renderHarnessPatch(options: HarnessPatchOptions): string {
   config:
     root: ${yamlString(paths.sessionsDir)}
     compression: none
+
+# Cap the per-response output budget. The provider default is the official
+# DeepSeek ceiling; a gateway that caps lower may answer with an empty turn
+# instead of an error, which reads as "the executor does nothing".
+#
+# Third-party gateways that emulate the Messages API also emit the occasional
+# malformed stream (a block delta without its start). That is a transport-level
+# glitch, not a model decision, so it is retried like the built-in transient
+# codes instead of ending the turn.
+- id: llm-deepseek
+  config:
+    maxTokens: ${envModelMaxTokens()}
+    thinking: ${envModelThinking() === 'off' ? 'disabled' : 'enabled'}
+    reasoningEffort: ${envModelThinking()}
+    retryPolicy:
+      mode: normal
+      maxRetries: 5
+      retryableCodes:
+        - EMPTY_RESPONSE
+        - RATE_LIMIT
+        - SERVER
+        - TIMEOUT
+        - TRANSPORT
+        - MALFORMED_RESPONSE
 
 # Executors need to run arbitrary local security tooling. The container, not
 # the per-Work process, is the isolation boundary.
