@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import type { ActivityEvent } from '../types.ts'
 import { AppError, describeError } from '../util/errors.ts'
 import type { Logger } from '../util/log.ts'
+import { OPENAI_COMPATIBLE_ROUTE } from '../util/model-limits.ts'
 import type { EnsureResult, HarnessDriver, PromptReceipt, WorkSessionSpec } from './driver.ts'
 import { normalizeSessionEvent, normalizeSessionStatus } from './events.ts'
 
@@ -448,7 +449,12 @@ export class SdkHarnessDriver implements HarnessDriver {
   private readonly logger: Logger
 
   constructor(options: SdkDriverOptions) {
-    this.options = options
+    this.options = {
+      ...options,
+      provider: options.provider === OPENAI_COMPATIBLE_ROUTE
+        ? OPENAI_COMPATIBLE_ROUTE
+        : options.provider,
+    }
     this.logger = options.logger
   }
 

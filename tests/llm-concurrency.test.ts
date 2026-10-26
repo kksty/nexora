@@ -191,7 +191,7 @@ test('信号量：取消可以追上尚未到达的 acquire', async () => {
   assert.deepEqual(semaphore.stats, { limit: 1, active: 0, queued: 0 })
 })
 
-test('并发配置只接受正整数，默认 4', () => {
+test('并发配置只接受正整数，默认 2', () => {
   assert.equal(parseModelConcurrency(undefined), DEFAULT_MODEL_CONCURRENCY)
   assert.equal(parseModelConcurrency('4'), 4)
   assert.equal(parseModelConcurrency(8), 8)

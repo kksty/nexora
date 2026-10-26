@@ -27,9 +27,17 @@ Web 默认监听 `127.0.0.1:43187`；每个任务从 `LIEBIAN_API_PORT_RANGE` �
 
 健康探针同时核对 task ID，避免旧端口被其他任务复用后误判原任务在线。多个 Task 共享 `.dsh`，容器入口使用文件锁串行化首次 profile 初始化，避免并发读取半写入的配置。
 
+Web 的 run、continue、resume 和 recover 入口共用同一任务启动 guard。启动失败后释放 guard，允许重试；并发请求不会各自启动一个容器。Docker inspect 只有明确的“容器/对象不存在”才视为未运行，其他 inspect 错误直接失败；已运行容器不会再被清理或重新创建。Web 保存的 provider、模型名、Base URL、模型上限、思考强度和并发会写入随后创建的任务 service environment，而不是只保存在 Web 设置中。损坏的设置文件通过 `savedInvalid` 暴露，并使用明确的环境值或默认值回退。
+
+模型适配器由 profile patch 选择。patch 的顶层条目只能覆改 profile 已挂载的插件，新增插件必须写进 `insert:` 块：`deepseek` 模式按 id 覆改原生 Messages 适配器；`openai-compatible` 模式把项目自有适配器放进 `insert:`，并禁用原生适配器，避免留下未配置的第二条路由。写在顶层的自建适配器会被 loader 以 `entry not found` 静默丢弃，因此该行为由真实 `dsh --dump-config` 装载用例守护，而不是断言生成文本。
+
 执行者拥有 bash、文件读写/编辑、glob/grep、job_output/list/kill、六个 terminal 工具与 `mcp__liebian__*`。禁用 skill、subagent、workflow、goal 等创建隐藏执行者的路径。HTTP 使用 CLI；任务记忆使用共享发现。模型循环、压缩、持久会话和 PTY 全部复用 harness。
 
 每次 terminal 工具返回后，插件从真实终端注册表记录 `liebian/terminals` 事件。驱动将事件转为运行时快照，投影为 `kind=terminal` 的生命周期记录，沿用既有阻塞、崩溃核对和展示路径。记录 ID 包含进程代次；不同代次的同名 PTY 不互相覆盖。终端空闲或某次发送结束不会清除生命周期记录；关闭/退出经注册表确认后才结算。无需解析 shell 输出猜测存活状态。
+
+执行者 MCP 桥接通过 stdio 提供 tools 表面，声明并支持 legacy MCP `2025-11-25`。`initialize` 必须首先调用并携带规定的版本、capabilities 和 clientInfo；未知或未来版本协商回 `2025-11-25`，不会虚报支持。通知不回复，解析失败、无效请求、未知方法和非法参数使用对应的 JSON-RPC 错误。当前 DSH 客户端先以 `server/discover` 探测 2026 modern 协议；桥接收到的响应是 method-not-found，随后按 legacy initialize 握手。桥接尚未实现 2026 modern server/discover、新传输、resources、prompts 或完整 SDK 迁移。
+
+Web 的执行者会话视图读取每会话日志最多 8 MiB 尾部、返回最多 400 条记录，并给出 `mode=tail` 的源字节、读取字节与省略字节，以及 `size`、`entries`、`content`、`corrupt` 或 `partial` 截断原因。未以换行结束的写入中尾记录会跳过；不安全的 session ID 或同名会话歧义不会被猜测解析。当前没有读取更早日志的字节游标分页。
 
 ## 资料、报告与重试
 
@@ -69,6 +77,8 @@ Docker Desktop 的 Windows 宿主与 Linux 容器不共享 SQLite 锁域。因�
 
 状态写入使用临时文件 + fsync + rename；Windows 暂时拒绝替换时有限重试，最终失败保留旧文件，绝不先删除目标。POSIX 还同步父目录。硬件、文件系统或突然断电仍不具备数据库级任务事务保证。删除任务先在锁内登记删除标记并移除权威状态，再释放系统句柄并清理目录，防止迟到写入者重建任务。
 
+2026-10-26 的有限合成探针通过生产发现、消息和原子状态路径增加五轮数据。最终累计 600 条发现、300 条消息，`state.json` 为 1,640,294 字节（1.564 MiB）；批次写入约 0.838–1.514 秒，`loadState` 约 1.589–5.980 毫秒，进程 RSS 采样 119.3–152.7 MiB。完整重载后的计数、连续 ID、共享版本和采样记录哈希一致。这个结果只是短时可重复基线，不能外推为长期容量、稳定上限或生产 SLA；探针不调用模型、Docker 或网络。
+
 模型名额绑定 work 和进程代次，旧进程退出只回收自己的名额；旧代次的新请求被拒绝。流取消、消费者提前退出和插件释放均主动关闭上游。默认 120 秒没有流进展（包括消费者遗弃）触发清理；上游 5 秒内无法关闭时请求运行时停止该进程，确认退出后回收名额，按正常失败流程恢复。停止进程会等待退出，必要时升级 SIGKILL；停止失败不会写成清理完成。
 
 ```
@@ -88,6 +98,7 @@ tasks/<id>/
 ## 当前边界
 
 - 执行者是同一任务信任域内的进程，能读共享凭据和本任务状态，不能把 work 身份当作抵抗恶意同容器进程的安全边界。host 进一步共享宿主网络，任务容器仍不获得 Docker socket。
-- MCP 桥接仍回显客户端请求的协议版本，只验证了当前 harness 使用的基础工具调用；没有完整协议版本协商。
-- `state.json` 每次整体序列化；SQLite 仅用于系统锁，不存任务数据。本版没有长期增长压测或跨主机故障转移，新增诊断记录状态大小、落盘耗时和资源变化，见 [运行诊断](DIAGNOSTICS.md)。
+- MCP 桥接只覆盖 legacy `2025-11-25` 的 stdio tools 表面及 DSH 回退路径；没有 2026 modern 协商、新传输或 resources/prompts 等完整 MCP 能力。
+- `state.json` 每次整体序列化；SQLite 仅用于系统锁，不存任务数据。已有五轮短时合成增长基线，但没有长期增长压测或跨主机故障转移；诊断记录持续提供状态大小、落盘耗时和资源变化，见 [运行诊断](DIAGNOSTICS.md) 与 [验证说明](VALIDATION.md)。
+- 会话视图只有 8 MiB 尾部窗口，前端当前统一显示“已截断”，未分别提示 partial、corrupt 等具体原因，也没有向更早日志继续翻页的接口。
 - 不提供多用户账户、每个 work 的独立安全隔离、中央调度/验收 agent 或预算管理。

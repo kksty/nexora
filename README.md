@@ -115,7 +115,7 @@ docker compose logs web
 | `DEEPSEEK_BASE_URL` | 空 | 可选的模型接口地址 |
 | `LIEBIAN_PROVIDER` | `deepseek-official` | 模型提供方 |
 | `LIEBIAN_MODEL` | `deepseek-flash` | 模型名称 |
-| `LIEBIAN_MODEL_CONCURRENCY` | `4` | 每个任务所有执行者合计的并发模型请求上限 |
+| `LIEBIAN_MODEL_CONCURRENCY` | `2` | 每个任务所有执行者合计的并发模型请求上限 |
 | `LIEBIAN_WEB_HOST` | `127.0.0.1` | 工作台监听地址 |
 | `LIEBIAN_WEB_PORT` | `43187` | 工作台端口 |
 | `LIEBIAN_WEB_TOKEN` | 启动时随机生成 | 可指定固定访问令牌，至少 8 个字符 |

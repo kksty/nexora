@@ -33,13 +33,12 @@ import {
   stopTaskFromWeb,
 } from './task-service.ts'
 import { reconcileTaskServices } from './docker-launcher.ts'
-import { parseModelConcurrency } from '../util/semaphore.ts'
-import { parseModelMaxTokens, parseModelThinking } from '../util/model-limits.ts'
 import { readWorkConversation } from './conversation.ts'
 import { DEFAULT_WEB_PORT, parsePort } from '../util/ports.ts'
 import {
   ENV_MODEL,
   ENV_PROVIDER,
+  applySettingsInput,
   clearWebSettings,
   envText,
   publicWebSettings,
@@ -451,28 +450,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         }
         const body = await readJsonBody(request)
         const current = await resolveWebSettings(tasksRoot)
-        const next = { ...current.settings }
-        if (typeof body.apiKey === 'string' && body.apiKey.trim().length > 0) {
-          if (body.apiKey.trim().length > 4096) throw new AppError('INVALID_ARGUMENT', 'API Key 过长')
-          next.apiKey = body.apiKey.trim()
-        }
-        if (body.clearApiKey === true) next.apiKey = ''
-        if (typeof body.provider === 'string') {
-          next.provider = body.provider.trim() || envText(ENV_PROVIDER) || 'deepseek-official'
-        }
-        if (typeof body.model === 'string') {
-          next.model = body.model.trim() || envText(ENV_MODEL) || 'deepseek-flash'
-        }
-        if (typeof body.baseUrl === 'string') next.baseUrl = body.baseUrl.trim()
-        if (body.modelConcurrency !== undefined) {
-          next.modelConcurrency = parseModelConcurrency(body.modelConcurrency)
-        }
-        if (body.modelMaxTokens !== undefined) {
-          next.modelMaxTokens = parseModelMaxTokens(body.modelMaxTokens)
-        }
-        if (body.modelThinking !== undefined) {
-          next.modelThinking = parseModelThinking(body.modelThinking)
-        }
+        const next = applySettingsInput(current, body)
         await saveWebSettings(tasksRoot, next)
         sendJson(response, 200, { ok: true, settings: publicWebSettings(await resolveWebSettings(tasksRoot)) })
         return

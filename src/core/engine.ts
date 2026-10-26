@@ -119,7 +119,7 @@ export interface EngineOptions {
   retry?: Partial<RetryPolicy>
   /**
    * Maximum number of model streams in flight across every executor in this
-   * task. The default is 4; the value comes from LIEBIAN_MODEL_CONCURRENCY.
+   * task. The default is 2; the value comes from LIEBIAN_MODEL_CONCURRENCY.
    */
   modelConcurrency?: number
   /**

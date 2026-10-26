@@ -296,7 +296,7 @@ test('Web UI：API 配置保存、清除且不回显 key', async (t) => {
   assert.equal((initial as any).settings.apiKeySet, false)
   assert.equal((initial as any).settings.provider, 'deepseek-official')
   assert.equal((initial as any).settings.model, 'deepseek-flash')
-  assert.equal((initial as any).settings.modelConcurrency, 4)
+  assert.equal((initial as any).settings.modelConcurrency, 2)
 
   const saved = await post(server, '/api/settings', {
     apiKey: 'sk-test-secret-123',
@@ -326,11 +326,53 @@ test('Web UI：API 配置保存、清除且不回显 key', async (t) => {
   const persisted = JSON.parse(await readFile(join(tasksRoot, '.web-settings.json'), 'utf8')) as { apiKey: string }
   assert.equal(persisted.apiKey, 'sk-test-secret-123')
 
-  const cleared = await post(server, '/api/settings', { clearApiKey: true, provider: 'deepseek-official', model: 'deepseek-flash' })
+  const cleared = await post(server, '/api/settings', {
+    clearApiKey: true,
+    modelApiProtocol: 'openai-compatible',
+    provider: 'gateway',
+    model: 'deepseek-flash',
+    baseUrl: 'https://example.test/v1',
+  })
   assert.equal(cleared.status, 200)
   assert.equal(cleared.body.settings.apiKeySet, false)
   const afterClear = JSON.parse(await readFile(join(tasksRoot, '.web-settings.json'), 'utf8')) as { apiKey: string }
   assert.equal(afterClear.apiKey, '')
+})
+
+test('Web UI：模型限制保存后按容器环境生效，非法配置不覆盖原值', async (t) => {
+  const { tasksRoot, server } = await createWebHarness(t)
+  const saved = await post(server, '/api/settings', {
+    apiKey: 'sk-settings',
+    modelApiProtocol: 'openai-compatible',
+    provider: 'gateway',
+    model: 'gateway-model',
+    baseUrl: 'https://gateway.example/v1',
+    modelMaxTokens: 4096,
+    modelThinking: 'low',
+  })
+  assert.equal(saved.status, 200)
+
+  const taskId = await createTask(server)
+  const paths = makeTaskPaths(tasksRoot, taskId)
+  const before = await readFile(paths.patchFile, 'utf8')
+  const invalid = await post(server, '/api/settings', { modelMaxTokens: 0 })
+  assert.equal(invalid.status, 400)
+  assert.equal(invalid.body.error.code, 'INVALID_ARGUMENT')
+  assert.equal(await readFile(join(tasksRoot, '.web-settings.json'), 'utf8'), JSON.stringify({
+    modelApiProtocol: 'openai-compatible',
+    modelContextWindow: 0,
+    modelAutoCompactRatio: 0.75,
+    modelSafetyMarginTokens: 2048,
+    modelThinkingAdapter: 'auto',
+    modelMaxTokens: 4096,
+    modelThinking: 'low',
+    modelConcurrency: 2,
+    provider: 'gateway',
+    model: 'gateway-model',
+    baseUrl: 'https://gateway.example/v1',
+    apiKey: 'sk-settings',
+  }, null, 2) + '\n')
+  assert.equal(await readFile(paths.patchFile, 'utf8'), before)
 })
 
 test('Web UI：环境变量可配置任意 provider，且前端保存后覆盖它、删除后回退', async (t) => {
@@ -418,11 +460,9 @@ test('Web UI：保存的空值可以关闭环境变量提供的 Key 与 Base URL
   })
 
   const { server } = await createWebHarness(t)
-  const saved = await post(server, '/api/settings', { clearApiKey: true, baseUrl: '', provider: 'pai', model: 'm' })
-  assert.equal(saved.status, 200)
-  assert.equal(saved.body.settings.apiKeySet, false)
-  assert.equal(saved.body.settings.apiKeySource, 'none')
-  assert.equal(saved.body.settings.baseUrl, '')
+  const saved = await post(server, '/api/settings', { clearApiKey: true, modelApiProtocol: 'openai-compatible', baseUrl: '', provider: 'pai', model: 'm' })
+  assert.equal(saved.status, 400)
+  assert.equal(saved.body.error.code, 'INVALID_ARGUMENT')
 })
 
 test('Web UI：获取模型列表并检测模型连通性', async (t) => {
@@ -457,12 +497,13 @@ test('Web UI：获取模型列表并检测模型连通性', async (t) => {
   )
   const url = `http://127.0.0.1:${port}`
 
-  const models = await post(server, '/api/settings/models', { apiKey: 'sk-test', baseUrl: `${url}/v1` })
+  const models = await post(server, '/api/settings/models', { apiKey: 'sk-test', modelApiProtocol: 'openai-compatible', baseUrl: `${url}/v1` })
   assert.equal(models.status, 200)
   assert.deepEqual(models.body.result.models, ['deepseek-chat', 'deepseek-reasoner'])
 
   const probe = await post(server, '/api/settings/test', {
     apiKey: 'sk-test',
+    modelApiProtocol: 'openai-compatible',
     model: 'deepseek-chat',
     baseUrl: `${url}/v1`,
   })

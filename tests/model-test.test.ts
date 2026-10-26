@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { chatCompletionsUrl, listModelConfig, modelsUrl, resolveModelConfig, testModelConfig } from '../src/web/model-test.ts'
+import { chatCompletionsUrl, listModelConfig, modelsUrl, parseVllmMaxModelLen, resolveModelConfig, testModelConfig, vllmMetricsUrl } from '../src/web/model-test.ts'
 import { effectiveWebSettings } from '../src/web/settings.ts'
 
 interface ModelRequest {
@@ -73,6 +73,7 @@ test('模型检测：成功时返回延迟、回复并发送最小请求', async
 
   const result = await testModelConfig(tasksRoot, {
     apiKey: 'sk-test-secret',
+    modelApiProtocol: 'openai-compatible',
     provider: 'deepseek-official',
     model: 'deepseek-chat',
     baseUrl: `${fake.url}/v1/`,
@@ -100,6 +101,7 @@ test('模型检测：HTTP 错误保留服务端原因且不回显 key', async (t
 
   const result = await testModelConfig(tasksRoot, {
     apiKey: 'sk-super-secret-value',
+    modelApiProtocol: 'openai-compatible',
     model: 'deepseek-chat',
     baseUrl: fake.url,
   })
@@ -126,6 +128,7 @@ test('模型检测：缺少 key 或自定义 provider 缺少 Base URL 时给出�
 
   const custom = await testModelConfig(tasksRoot, {
     apiKey: 'sk-test',
+    modelApiProtocol: 'openai-compatible',
     provider: 'custom-provider',
     model: 'custom-model',
   })
@@ -174,6 +177,7 @@ test('模型检测：非 deepseek-official 的 provider 只要配了 Base URL �
     join(tasksRoot, '.web-settings.json'),
     JSON.stringify({
       apiKey: 'sk-saved',
+      modelApiProtocol: 'openai-compatible',
       provider: 'custom-gateway',
       model: 'glm-5',
       baseUrl: fake.url,
@@ -203,6 +207,7 @@ test('模型检测：未填写的字段回退到已保存配置', async (t) => {
     join(tasksRoot, '.web-settings.json'),
     JSON.stringify({
       apiKey: 'sk-saved-key',
+      modelApiProtocol: 'openai-compatible',
       provider: 'deepseek-official',
       model: 'saved-model',
       baseUrl: fake.url,
@@ -241,6 +246,7 @@ test('模型列表：获取、去重并排序可用模型', async (t) => {
 
   const result = await listModelConfig(tasksRoot, {
     apiKey: 'sk-list-secret',
+    modelApiProtocol: 'openai-compatible',
     provider: 'deepseek-official',
     baseUrl: `${fake.url}/v1/`,
   })
@@ -259,13 +265,13 @@ test('模型列表：接口不支持或返回空列表时提示手动填写', as
     body: { error: { message: 'Not Found' } },
   }))
   const tasksRoot = await createTasksRoot(t)
-  const missing = await listModelConfig(tasksRoot, { apiKey: 'sk-test', baseUrl: notFound.url })
+  const missing = await listModelConfig(tasksRoot, { apiKey: 'sk-test', modelApiProtocol: 'openai-compatible', baseUrl: notFound.url })
   assert.equal(missing.success, false)
   assert.equal(missing.models.length, 0)
   assert.match(missing.message, /手动填写/)
 
   const emptyServer = await startModelServer(t, () => ({ status: 200, body: { data: [] } }))
-  const empty = await listModelConfig(tasksRoot, { apiKey: 'sk-test', baseUrl: emptyServer.url })
+  const empty = await listModelConfig(tasksRoot, { apiKey: 'sk-test', modelApiProtocol: 'openai-compatible', baseUrl: emptyServer.url })
   assert.equal(empty.success, true)
   assert.deepEqual(empty.models, [])
   assert.match(empty.message, /手动填写/)
@@ -276,6 +282,49 @@ test('模型列表：Base URL 归一化为 models 端点', () => {
   assert.equal(modelsUrl('https://api.deepseek.com/v1/'), 'https://api.deepseek.com/v1/models')
   assert.equal(modelsUrl('https://proxy.test/chat/completions'), 'https://proxy.test/models')
   assert.equal(modelsUrl('https://proxy.test/v1/models'), 'https://proxy.test/v1/models')
+})
+
+test('vLLM context discovery only trusts cache_config_info max_model_len', async (t) => {
+  const seen: string[] = []
+  const server = createServer((request, response) => {
+    seen.push(request.url ?? '')
+    if (request.url === '/metrics') {
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.end('# HELP vllm:cache_config_info Cache configuration\nvllm:cache_config_info{gpu_cache_size="1",max_model_len="65536"} 1\n')
+      return
+    }
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ choices: [{ message: { content: 'metrics-ok' } }] }))
+  })
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      if (address === null || typeof address === 'string') return reject(new Error('metrics server has no address'))
+      resolve(address.port)
+    })
+  })
+  t.after(() => new Promise<void>((resolve) => {
+    server.close(() => resolve())
+    server.closeAllConnections()
+  }))
+  const tasksRoot = await createTasksRoot(t)
+  const result = await testModelConfig(tasksRoot, {
+    modelApiProtocol: 'openai-compatible',
+    modelThinkingAdapter: 'vllm',
+    apiKey: '',
+    provider: 'local-vllm',
+    model: 'qwen-custom-id',
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+  })
+  assert.equal(result.success, true)
+  assert.equal(result.contextWindow.contextWindowEffective, 65_536)
+  assert.equal(result.contextWindow.contextWindowSource, 'server-metrics')
+  assert.equal(result.contextWindow.contextWindowKnown, true)
+  assert.deepEqual(seen, ['/metrics', '/v1/chat/completions'])
+  assert.equal(vllmMetricsUrl(`http://127.0.0.1:${port}/v1/`), `http://127.0.0.1:${port}/metrics`)
+  assert.equal(parseVllmMaxModelLen('vllm:other_metric{max_model_len="123"} 1\n'), null)
+  assert.equal(parseVllmMaxModelLen('vllm:cache_config_info{max_model_len="32768"} 1\n'), 32_768)
 })
 
 test('API 配置：未保存时回退到 LIEBIAN_PROVIDER / LIEBIAN_MODEL 环境变量', async (t) => {
@@ -306,4 +355,38 @@ test('API 配置：未保存时回退到 LIEBIAN_PROVIDER / LIEBIAN_MODEL 环境
   const resolved = await resolveModelConfig(tasksRoot, { apiKey: 'sk-env' })
   assert.equal(resolved.config.provider, 'env-provider')
   assert.equal(resolved.config.model, 'env-model')
+})
+
+test('API 配置：损坏设置文件与非法数值不会伪装成环境来源', async (t) => {
+  const tasksRoot = await createTasksRoot(t)
+  const previous = {
+    concurrency: process.env.LIEBIAN_MODEL_CONCURRENCY,
+    tokens: process.env.LIEBIAN_MODEL_MAX_TOKENS,
+    thinking: process.env.LIEBIAN_MODEL_THINKING,
+  }
+  process.env.LIEBIAN_MODEL_CONCURRENCY = '0'
+  process.env.LIEBIAN_MODEL_MAX_TOKENS = 'abc'
+  process.env.LIEBIAN_MODEL_THINKING = 'turbo'
+  t.after(() => {
+    for (const [key, value] of [
+      ['LIEBIAN_MODEL_CONCURRENCY', previous.concurrency],
+      ['LIEBIAN_MODEL_MAX_TOKENS', previous.tokens],
+      ['LIEBIAN_MODEL_THINKING', previous.thinking],
+    ] as const) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+
+  const settings = await effectiveWebSettings(tasksRoot)
+  assert.equal(settings.modelConcurrency, 2)
+  assert.equal(settings.modelMaxTokens, 6_144)
+  assert.equal(settings.modelThinking, 'high')
+
+  await writeFile(join(tasksRoot, '.web-settings.json'), '{bad json', 'utf8')
+  const { resolved } = await import('../src/web/settings.ts').then(async (module) => ({
+    resolved: await module.resolveWebSettings(tasksRoot),
+  }))
+  assert.equal(resolved.savedInvalid, true)
+  assert.equal(resolved.savedOverride, true)
 })

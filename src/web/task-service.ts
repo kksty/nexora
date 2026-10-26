@@ -27,6 +27,7 @@ import { nowIso } from '../util/time.ts'
 import {
   composeWebMode,
   dockerTaskRunning,
+  type DockerStartResult,
   removeDockerTaskContainer,
   sendDockerTaskCommand,
   setDockerTaskInformation,
@@ -133,7 +134,7 @@ export interface StartRunOptions {
 
 const healthCache = new Map<string, { at: number; alive: boolean }>()
 const containerCache = new Map<string, { at: number; running: boolean }>()
-const startGuard = new Map<string, number>()
+const startGuard = new Map<string, Promise<unknown>>()
 const CONTAINER_CACHE_MS = 4_000
 
 /** Health-check a daemon, caching the result briefly so task lists stay cheap. */
@@ -481,16 +482,34 @@ export async function startTaskRun(options: StartRunOptions): Promise<StartRunRe
   if (!composeWebMode()) {
     throw new AppError('COMPOSE_REQUIRED', '任务只能由 Docker Compose 启动；请使用 docker compose up -d')
   }
-  const guardAt = startGuard.get(options.taskId)
-  if (guardAt !== undefined) {
+  if (startGuard.has(options.taskId)) {
     throw new AppError('ALREADY_STARTING', '任务正在启动中；如果失败，请查看 daemon 日志后重试')
   }
-  startGuard.set(options.taskId, Date.now())
+  const starting = startDockerTask(paths, options.logger)
+  startGuard.set(options.taskId, starting)
   try {
-    const result = await startDockerTask(paths, options.logger)
+    const result = await starting
     return { pid: result.pid }
   } finally {
-    startGuard.delete(options.taskId)
+    if (startGuard.get(options.taskId) === starting) startGuard.delete(options.taskId)
+  }
+}
+
+/** Serialize starts from continue/resume/recover with the dashboard run action. */
+async function startDockerTaskOnce(paths: TaskPaths, logger?: Logger): Promise<DockerStartResult> {
+  const existing = startGuard.get(paths.taskId)
+  if (existing !== undefined) {
+    // A second request may belong to a different continue/resume request.
+    // Joining the first start is safe because both only wait for this task's
+    // runtime; a failure remains visible to both callers.
+    return (await existing) as DockerStartResult
+  }
+  const starting = startDockerTask(paths, logger)
+  startGuard.set(paths.taskId, starting)
+  try {
+    return await starting
+  } finally {
+    if (startGuard.get(paths.taskId) === starting) startGuard.delete(paths.taskId)
   }
 }
 
@@ -783,7 +802,7 @@ export async function continueTaskFromWeb(
   let startError: string | undefined
   if (composeWebMode()) {
     try {
-      await startDockerTask(paths)
+      await startDockerTaskOnce(paths)
       started = true
     } catch (error) {
       startError = describeError(error)
@@ -877,7 +896,7 @@ export async function resumeTaskFromWeb(
   let startError: string | undefined
   if (composeWebMode()) {
     try {
-      await startDockerTask(paths)
+      await startDockerTaskOnce(paths)
       started = true
     } catch (error) {
       startError = describeError(error)
@@ -968,7 +987,7 @@ export async function recoverTaskFromWeb(
   let startError: string | undefined
   if (result.created && composeWebMode()) {
     try {
-      await startDockerTask(paths)
+      await startDockerTaskOnce(paths)
       started = true
     } catch (error) {
       startError = describeError(error)

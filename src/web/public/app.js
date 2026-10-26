@@ -86,6 +86,15 @@ const state = {
   },
 }
 
+// Hooks are inert in the browser and can be enabled by the local VM tests.
+const conversationHooks = globalThis.__nexoraConversationHooks ?? {}
+const conversationTestHooks = {
+  fetch: null,
+  setInterval: null,
+  clearInterval: null,
+  setPolling: null,
+}
+
 const esc = (value) =>
   String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;',
@@ -151,10 +160,11 @@ async function api(path, options = {}) {
   const headers = { accept: 'application/json' }
   if (options.body !== undefined) headers['content-type'] = 'application/json'
   if (method !== 'GET') headers['x-liebian-web'] = '1'
-  const response = await fetch(path, {
+  const response = await (conversationTestHooks.fetch ?? fetch)(path, {
     method,
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   })
   let payload = null
   try {
@@ -207,6 +217,7 @@ function renderDashboard() {
 }
 
 function showDashboard() {
+  closeConversationModal()
   closeStream()
   state.currentId = null
   state.detail = null
@@ -284,6 +295,7 @@ async function selectTask(taskId, options = {}) {
   $('#workspace-home').classList.remove('active')
   $('#breadcrumb').textContent = '任务详情'
   const changed = state.currentId !== taskId
+  if (changed) closeConversationModal()
   state.currentId = taskId
   state.file = null
   if (changed) {
@@ -826,11 +838,42 @@ function workCard(work) {
 
 let conversationTimer = null
 let conversationSignature = ''
+let conversationController = null
+let conversationView = null
+let conversationSession = 0
+let conversationKeydown = null
+
+function removeConversationKeydown() {
+  if (conversationKeydown !== null) document.removeEventListener('keydown', conversationKeydown)
+  conversationKeydown = null
+}
 
 function stopConversationRefresh() {
-  if (conversationTimer !== null) clearInterval(conversationTimer)
+  if (conversationTimer !== null) (conversationTestHooks.clearInterval ?? clearInterval)(conversationTimer)
   conversationTimer = null
+  if (conversationController !== null) conversationController.abort()
+  conversationController = null
+  removeConversationKeydown()
   conversationSignature = ''
+  conversationView = null
+  conversationSession += 1
+}
+
+function conversationRequestIsCurrent(view, session, taskId, workId) {
+  return (
+    view !== null &&
+    conversationView === view &&
+    view.session === session &&
+    view.taskId === taskId &&
+    view.workId === workId &&
+    view.modal !== null &&
+    view.modal.isConnected !== false &&
+    state.currentId === taskId
+  )
+}
+
+function conversationSignatureFor(conversation) {
+  return `${conversation.workId}:${conversation.sessionId}:${conversation.entries.length}:${conversation.entries.at(-1)?.seq ?? 0}:${conversation.truncated}`
 }
 
 function conversationEntryHtml(entry) {
@@ -876,10 +919,11 @@ function renderConversation(conversation, options = {}) {
   if (list === null) return
   // Polling every few seconds must not rebuild an unchanged transcript: it
   // would collapse the <details> the reader just opened and reset scroll.
-  const signature = `${conversation.entries.length}:${conversation.entries.at(-1)?.seq ?? 0}:${conversation.truncated}`
+  const signature = conversationSignatureFor(conversation)
   if (signature === conversationSignature && options.force !== true) return
   conversationSignature = signature
   const nearBottom = options.forceBottom === true || list.scrollHeight - list.scrollTop - list.clientHeight < 80
+  const previousScrollTop = list.scrollTop
   list.innerHTML = conversation.entries.length === 0
     ? '<div class="empty-hint">这个执行者还没有产生对话。任务运行时启动后，第一条消息会出现在这里。</div>'
     : conversation.entries.map(conversationEntryHtml).join('')
@@ -888,26 +932,67 @@ function renderConversation(conversation, options = {}) {
     meta.textContent = `${conversation.entries.length} 条记录${conversation.truncated ? '（已截断，仅显示最近部分）' : ''} · 会话 ${conversation.sessionId}`
   }
   if (nearBottom) list.scrollTop = list.scrollHeight
+  else list.scrollTop = previousScrollTop
 }
 
 async function loadConversation(workId, options = {}) {
-  if (state.currentId === null) return
+  const taskId = state.currentId
+  if (taskId === null) return
+  const view = options.view ?? conversationView
+  const session = options.session ?? view?.session
+  if (
+    view === null ||
+    view === undefined ||
+    !conversationRequestIsCurrent(view, session, taskId, workId)
+  ) {
+    return
+  }
+  if (conversationController !== null) conversationController.abort()
+  const controller = new AbortController()
+  conversationController = controller
   try {
     const payload = await api(
-      `/api/tasks/${encodeURIComponent(state.currentId)}/conversation?work=${encodeURIComponent(workId)}`,
+      `/api/tasks/${encodeURIComponent(taskId)}/conversation?work=${encodeURIComponent(workId)}`,
+      { signal: controller.signal },
     )
-    if (document.getElementById('chat-list') === null) return
+    if (!conversationRequestIsCurrent(view, session, taskId, workId)) return
+    const errorEl = document.getElementById('chat-error')
+    if (errorEl !== null) {
+      errorEl.hidden = true
+      errorEl.textContent = ''
+    }
     renderConversation(payload.conversation, options)
   } catch (error) {
+    if (
+      controller.signal.aborted ||
+      error?.name === 'AbortError' ||
+      !conversationRequestIsCurrent(view, session, taskId, workId)
+    ) {
+      return
+    }
     const list = document.getElementById('chat-list')
-    if (list !== null) list.innerHTML = `<div class="empty-hint">${esc(error.message || String(error))}</div>`
+    if (list === null) return
+    const message = error.message || String(error)
+    if (conversationSignature.length === 0) {
+      list.innerHTML = `<div class="empty-hint">${esc(message)}</div>`
+    } else {
+      const errorEl = document.getElementById('chat-error')
+      if (errorEl !== null) {
+        errorEl.textContent = `刷新失败：${message}`
+        errorEl.hidden = false
+      }
+    }
+  } finally {
+    if (conversationController === controller) conversationController = null
   }
 }
 
 function openConversation(workId) {
   if (state.currentId === null) return
-  stopConversationRefresh()
+  closeConversationModal()
   const root = $('#modal-root')
+  const currentTask = state.currentId
+  conversationHooks.onOpen?.({ workId, taskId: currentTask })
   root.innerHTML = `<div class="modal-backdrop">
     <div class="modal chat-modal" role="dialog" aria-modal="true" aria-label="${esc(workId)} 的对话">
       <div class="modal-head">
@@ -917,27 +1002,123 @@ function openConversation(workId) {
         <button class="btn small ghost" type="button" data-chat-refresh>刷新</button>
         <button class="modal-close" type="button" data-chat-close aria-label="关闭">×</button>
       </div>
+      <div class="chat-error" id="chat-error" role="alert" hidden></div>
       <div class="chat-list" id="chat-list"><div class="empty-hint">加载中…</div></div>
     </div>
   </div>`
-  const close = () => {
-    stopConversationRefresh()
-    root.innerHTML = ''
+  const view = {
+    session: conversationSession,
+    taskId: currentTask,
+    workId,
+    modal: root.querySelector('.chat-modal'),
+    polling: false,
   }
-  root.querySelector('[data-chat-close]').addEventListener('click', close)
+  conversationView = view
+  conversationKeydown = (event) => {
+    if (event.key === 'Escape') closeConversationModal()
+  }
+  document.addEventListener('keydown', conversationKeydown)
+  root.querySelector('[data-chat-close]').addEventListener('click', closeConversationModal)
   root.querySelector('.modal-backdrop').addEventListener('mousedown', (event) => {
-    if (event.target === root.querySelector('.modal-backdrop')) close()
+    if (event.target === root.querySelector('.modal-backdrop')) closeConversationModal()
   })
-  root.querySelector('[data-chat-refresh]').addEventListener('click', () => void loadConversation(workId, { forceBottom: false, force: true }))
-  void loadConversation(workId, { forceBottom: true })
-  conversationTimer = setInterval(() => {
-    if (document.getElementById('chat-list') === null) {
-      stopConversationRefresh()
+  root.querySelector('[data-chat-refresh]').addEventListener('click', () => {
+    void loadConversation(workId, { forceBottom: false, force: true, view, session: view.session })
+  })
+  void loadConversation(workId, { forceBottom: true, view, session: view.session })
+  const startPolling = () => {
+    if (!conversationRequestIsCurrent(view, view.session, view.taskId, workId)) return
+    if (conversationTimer !== null) clearInterval(conversationTimer)
+    view.polling = true
+    conversationHooks.onPollStart?.()
+    conversationTimer = (conversationTestHooks.setInterval ?? setInterval)(() => {
+      if (
+        document.visibilityState !== 'visible' ||
+        !conversationRequestIsCurrent(view, view.session, view.taskId, workId)
+      ) {
+        closeConversationModal()
+        return
+      }
+      void loadConversation(workId, { view, session: view.session })
+    }, 3000)
+  }
+  view.pause = () => {
+    if (!view.polling) return
+    view.polling = false
+    pauseConversationRefresh()
+  }
+  view.resume = () => {
+    if (!conversationRequestIsCurrent(view, view.session, view.taskId, workId)) return
+    void loadConversation(workId, { view, session: view.session })
+    startPolling()
+  }
+  startPolling()
+}
+
+function pauseConversationRefresh() {
+  if (conversationView !== null) conversationView.polling = false
+  if (conversationTimer !== null) (conversationTestHooks.clearInterval ?? clearInterval)(conversationTimer)
+  conversationTimer = null
+  if (conversationController !== null) conversationController.abort()
+  conversationController = null
+  conversationHooks.onPollPause?.()
+}
+
+function resumeConversationRefresh() {
+  const view = conversationView
+  if (
+    view === null ||
+    !conversationRequestIsCurrent(view, view.session, view.taskId, view.workId)
+  ) {
+    return
+  }
+  if (view.polling === true) return
+  if (typeof view.resume === 'function') {
+    view.resume()
+    return
+  }
+  void loadConversation(view.workId, { view, session: view.session })
+  conversationTimer = (conversationTestHooks.setInterval ?? setInterval)(() => {
+    if (
+      document.visibilityState !== 'visible'
+    ) {
+      pauseConversationRefresh()
       return
     }
-    void loadConversation(workId)
+    void loadConversation(view.workId, { view, session: view.session })
   }, 3000)
 }
+
+function closeConversationModal() {
+  const root = $('#modal-root')
+  const view = conversationView
+  const ownsModal =
+    view !== null
+      ? view.modal !== null && view.modal.isConnected !== false
+      : root !== null && root.querySelector('.chat-modal') !== null
+  stopConversationRefresh()
+  if (ownsModal && root !== null) {
+    root.innerHTML = ''
+    conversationHooks.onClose?.()
+  }
+}
+
+if (conversationHooks.exposeTest === true) {
+  globalThis.__nexoraConversationTest = {
+    hooks: conversationTestHooks,
+    state,
+    closeConversationModal,
+    loadConversation,
+    openConversation,
+    pauseConversationRefresh,
+    renderConversation,
+    resumeConversationRefresh,
+  }
+}
+
+document.addEventListener('nexora:modal-before-replace', () => {
+  if (conversationView !== null) closeConversationModal()
+})
 
 // ---------------------------------------------------------------------------
 // Findings
@@ -1584,6 +1765,7 @@ async function copyCurrentFile() {
 // ---------------------------------------------------------------------------
 
 function openModal({ title, bodyHtml, confirmText = '确定', confirmClass = 'primary', onConfirm }) {
+  closeConversationModal()
   const root = $('#modal-root')
   root.innerHTML = `<div class="modal-backdrop">
     <div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
@@ -1988,7 +2170,11 @@ setInterval(() => {
 }, 5_000)
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return
+  if (document.visibilityState !== 'visible') {
+    pauseConversationRefresh()
+    return
+  }
+  resumeConversationRefresh()
   void loadTasks().catch(() => undefined)
   if (state.currentId !== null) void loadDetail(state.currentId, { preserveScroll: true })
 })

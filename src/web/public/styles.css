@@ -674,6 +674,15 @@ details.history summary:hover { color: var(--muted); }
 .field textarea:focus, .field select:focus, .field input:focus { border-color: rgba(94, 234, 212, 0.45); }
 .field textarea { min-height: 130px; font-family: var(--mono); font-size: 12px; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.field-help { display: block; color: var(--faint); font-size: 10.5px; line-height: 1.55; }
+.input-with-presets { display: flex; align-items: stretch; gap: 5px; flex-wrap: wrap; }
+.input-with-presets input { min-width: 130px; flex: 1 1 150px; }
+.input-with-presets .btn { flex: 0 0 auto; }
+.input-with-suffix { position: relative; }
+.input-with-suffix input { padding-right: 34px !important; }
+.input-with-suffix > span { position: absolute; right: 11px; top: 50%; transform: translateY(-50%); color: var(--faint); font-size: 12px; pointer-events: none; }
+.budget-preview { padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--panel-2); font-size: 11.5px; line-height: 1.6; }
+.budget-preview.err { color: var(--red); border-color: rgba(251, 113, 133, 0.3); background: rgba(251, 113, 133, 0.06); }
 .modal-error { color: var(--red); font-size: 12px; white-space: pre-wrap; }
 .modal-note { color: var(--muted); font-size: 12px; line-height: 1.6; }
 .radio-line { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
@@ -913,6 +922,8 @@ body { background: var(--bg); -webkit-font-smoothing: antialiased; }
 .chat-modal .modal-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .chat-modal .modal-head .spacer { flex: 1; }
 .chat-meta { color: var(--faint); font-size: 11px; }
+.chat-error { margin: 8px 20px 0; color: var(--red); font-size: 11.5px; line-height: 1.5; }
+.chat-error[hidden] { display: none; }
 .chat-list { flex: 1; min-height: 260px; max-height: 68vh; overflow: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
 .chat-row { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 10px 13px; }
 .chat-row.user { background: rgba(94, 234, 212, 0.05); border-color: rgba(94, 234, 212, 0.24); }

@@ -23,12 +23,17 @@ import { AppError, describeError } from '../util/errors.ts'
 import { isValidTaskId } from '../util/ids.ts'
 import type { Logger } from '../util/log.ts'
 import { Mutex } from '../util/mutex.ts'
-import { effectiveWebSettings } from './settings.ts'
+import { effectiveWebSettings, modelSettingsEnvironment } from './settings.ts'
+import { renderHarnessPatch } from '../harness/patch.ts'
 import { readDaemonInfo, callDaemon } from '../core/daemon.ts'
 import { taskStartTimeout, waitForRuntimeReady } from './readiness.ts'
 
 export interface DockerStartResult {
   pid: number
+}
+
+function shouldUseShell(executable: string): boolean {
+  return process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable)
 }
 
 /**
@@ -207,6 +212,13 @@ const MODEL_ENV_KEYS = [
   'LIEBIAN_BASE_URL',
   'LIEBIAN_PROVIDER',
   'LIEBIAN_MODEL',
+  'LIEBIAN_MODEL_MAX_TOKENS',
+  'LIEBIAN_MODEL_THINKING',
+  'LIEBIAN_MODEL_API_PROTOCOL',
+  'LIEBIAN_MODEL_CONTEXT_WINDOW',
+  'LIEBIAN_MODEL_AUTO_COMPACT_RATIO',
+  'LIEBIAN_MODEL_SAFETY_MARGIN_TOKENS',
+  'LIEBIAN_MODEL_THINKING_ADAPTER',
 ] as const
 
 /** Environment values worth forwarding to the Task container. */
@@ -219,6 +231,11 @@ const PASSTHROUGH_ENV = [
   'LIEBIAN_MODEL',
   'LIEBIAN_MODEL_MAX_TOKENS',
   'LIEBIAN_MODEL_THINKING',
+  'LIEBIAN_MODEL_API_PROTOCOL',
+  'LIEBIAN_MODEL_CONTEXT_WINDOW',
+  'LIEBIAN_MODEL_AUTO_COMPACT_RATIO',
+  'LIEBIAN_MODEL_SAFETY_MARGIN_TOKENS',
+  'LIEBIAN_MODEL_THINKING_ADAPTER',
   'LIEBIAN_MODEL_CONCURRENCY',
   'LIEBIAN_MODEL_STREAM_IDLE_MS',
   'LIEBIAN_DIAGNOSTICS_INTERVAL_MS',
@@ -334,6 +351,7 @@ function runDocker(
       stdio,
       windowsHide: true,
       env,
+      shell: shouldUseShell(dockerBin()),
     })
     const timer = setTimeout(() => {
       child.kill()
@@ -392,6 +410,7 @@ async function dockerOutput(args: string[]): Promise<string> {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       env: process.env,
+      shell: shouldUseShell(dockerBin()),
     })
     const timer = setTimeout(() => {
       child.kill()
@@ -420,12 +439,23 @@ async function dockerOutput(args: string[]): Promise<string> {
   })
 }
 
+function isMissingContainerError(error: unknown): boolean {
+  return (
+    error instanceof AppError &&
+    error.code === 'DOCKER_COMMAND_FAILED' &&
+    /no such (?:container|object)|container .* (?:does not exist|not found)/i.test(error.message)
+  )
+}
+
 async function containerRunning(name: string): Promise<boolean> {
   try {
     const output = await dockerOutput(['inspect', '-f', '{{.State.Running}}', name])
     return output.trim() === 'true'
-  } catch {
-    return false
+  } catch (error) {
+    if (isMissingContainerError(error)) return false
+    // An inspect failure is not proof that the container is absent. Continuing
+    // could recreate or modify a live user container after a transient error.
+    throw error
   }
 }
 
@@ -455,8 +485,9 @@ export async function removeDockerTaskContainer(paths: TaskPaths): Promise<void>
 async function removeStoppedContainer(name: string): Promise<void> {
   try {
     await dockerOutput(['inspect', name])
-  } catch {
-    return
+  } catch (error) {
+    if (isMissingContainerError(error)) return
+    throw error
   }
   if (await containerRunning(name)) {
     throw new AppError('ALREADY_RUNNING', `任务容器已在运行：${name}`)
@@ -480,19 +511,22 @@ export async function startDockerTask(paths: TaskPaths, logger?: Logger): Promis
   // Web UI deliberately cleared. Then write the effective configuration back,
   // under both the provider-neutral and the legacy DeepSeek names.
   for (const key of MODEL_ENV_KEYS) delete containerEnv[key]
-  if (settings.apiKey.length > 0) {
-    containerEnv.DEEPSEEK_API_KEY = settings.apiKey
-    containerEnv.LIEBIAN_API_KEY = settings.apiKey
-  }
-  if (settings.provider.length > 0) containerEnv.LIEBIAN_PROVIDER = settings.provider
-  if (settings.model.length > 0) containerEnv.LIEBIAN_MODEL = settings.model
-  if (settings.baseUrl.length > 0) {
-    containerEnv.DEEPSEEK_BASE_URL = settings.baseUrl
-    containerEnv.LIEBIAN_BASE_URL = settings.baseUrl
-  }
-  containerEnv.LIEBIAN_MODEL_CONCURRENCY = String(settings.modelConcurrency)
-  containerEnv.LIEBIAN_MODEL_MAX_TOKENS = String(settings.modelMaxTokens)
-  containerEnv.LIEBIAN_MODEL_THINKING = settings.modelThinking
+  Object.assign(containerEnv, modelSettingsEnvironment(settings))
+
+  await writeFileAtomic(
+    paths.patchFile,
+    renderHarnessPatch({
+      paths,
+      mcpEntry: fileURLToPath(new URL('../mcp/main.ts', import.meta.url)),
+      nodeExecutable: process.execPath,
+      model: {
+        ...settings,
+        modelId: settings.model,
+        provider: settings.modelApiProtocol === 'openai-compatible' ? 'liebian-openai-compatible' : settings.provider,
+        baseUrl: settings.baseUrl,
+      },
+    }),
+  )
 
   const home = dshHome(paths)
   await mkdir(home, { recursive: true })
@@ -638,6 +672,7 @@ function runDockerCapture(
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       env: process.env,
+      shell: shouldUseShell(dockerBin()),
     })
     const timer = setTimeout(() => {
       child.kill()

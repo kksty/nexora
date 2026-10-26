@@ -8,20 +8,26 @@
  * echoed back in a result.
  */
 import { AppError, describeError } from '../util/errors.ts'
-import { resolveWebSettings } from './settings.ts'
+import { applySettingsInput, resolveWebSettings, validateModelSettings } from './settings.ts'
+import { contextBudget, contextBudgetFromServerMetrics, type ContextBudgetStatus, type ModelApiProtocol } from '../util/model-limits.ts'
 
 export interface ModelConfigInput {
   apiKey?: unknown
+  clearApiKey?: unknown
+  modelApiProtocol?: unknown
   provider?: unknown
   model?: unknown
   baseUrl?: unknown
+  modelThinkingAdapter?: unknown
 }
 
-export type ApiKeySource = 'request' | 'saved' | 'environment' | 'none'
+export type ApiKeySource = 'request' | 'saved' | 'environment' | 'default' | 'none'
 
 export interface ResolvedModelConfig {
   apiKey: string
   apiKeySource: ApiKeySource
+  modelApiProtocol: ModelApiProtocol
+  settings: import('./settings.ts').WebSettings
   provider: string
   model: string
   /** Normalized to http(s), without query/hash or a trailing slash. */
@@ -30,7 +36,7 @@ export interface ResolvedModelConfig {
 
 export type ConfigResolution =
   | { ok: true; config: ResolvedModelConfig }
-  | { ok: false; config: Omit<ResolvedModelConfig, 'baseUrl'>; message: string }
+  | { ok: false; config: Partial<ResolvedModelConfig>; message: string }
 
 export interface ModelTestResult {
   success: boolean
@@ -42,6 +48,8 @@ export interface ModelTestResult {
   status?: number
   reply?: string
   message: string
+  protocol: ModelApiProtocol
+  contextWindow: ContextBudgetStatus
 }
 
 export interface ModelListResult {
@@ -52,12 +60,15 @@ export interface ModelListResult {
   models: string[]
   latencyMs: number
   message: string
+  protocol: ModelApiProtocol
+  contextWindow: ContextBudgetStatus
 }
 
-const DEFAULT_BASE_URL = 'https://api.deepseek.com'
+const DEFAULT_BASE_URL = 'https://api.deepseek.com/anthropic'
 const TIMEOUT_MS = 20_000
 const MAX_REPLY = 160
 const MAX_MODELS = 1_000
+const METRICS_TIMEOUT_MS = 2_000
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
@@ -95,6 +106,13 @@ export function modelsUrl(baseUrl: string): string {
     return `${trimmed.slice(0, -'/chat/completions'.length).replace(/\/+$/, '')}/models`
   }
   return `${trimmed}/models`
+}
+
+/** The native DeepSeek Messages adapter appends /v1 at request time. */
+export function deepSeekMessagesUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '')
+  const root = trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`
+  return `${root}/messages`
 }
 
 function providerError(payload: unknown, raw: string): string {
@@ -137,6 +155,54 @@ function extractModelIds(payload: unknown): string[] {
   return [...ids].sort((left, right) => left.localeCompare(right)).slice(0, MAX_MODELS)
 }
 
+/** vLLM exposes this Prometheus metric at the server root, outside /v1. */
+export function vllmMetricsUrl(baseUrl: string): string {
+  const parsed = new URL(baseUrl)
+  const path = parsed.pathname.replace(/\/+$/, '')
+  parsed.pathname = `${path.replace(/\/v1$/i, '')}/metrics`.replace(/\/+/g, '/')
+  parsed.search = ''
+  parsed.hash = ''
+  return parsed.toString()
+}
+
+/** Parse vLLM's cache_config_info metric without treating unrelated model labels as capacity. */
+export function parseVllmMaxModelLen(metrics: string): number | null {
+  for (const line of metrics.split(/\r?\n/)) {
+    if (!/(?:^|\s)(?:vllm:)?cache_config_info(?:\{|\s|$)/.test(line)) continue
+    const match = line.match(/(?:\{|,)\s*max_model_len\s*=\s*["'](\d+)["']/)
+    if (match === null) continue
+    const value = Number(match[1])
+    if (Number.isSafeInteger(value) && value > 0) return value
+  }
+  return null
+}
+
+async function discoverVllmContextWindow(baseUrl: string, apiKey: string): Promise<number | null> {
+  let endpoint: string
+  try { endpoint = vllmMetricsUrl(baseUrl) } catch { return null }
+  try {
+    const response = await fetch(endpoint, {
+      headers: { ...(apiKey.length > 0 ? { authorization: `Bearer ${apiKey}` } : {}), accept: 'text/plain' },
+      signal: AbortSignal.timeout(METRICS_TIMEOUT_MS),
+    })
+    if (!response.ok) return null
+    return parseVllmMaxModelLen(await response.text())
+  } catch {
+    return null
+  }
+}
+
+async function contextWindowForConfig(
+  settings: import('./settings.ts').WebSettings,
+  baseUrl: string,
+  apiKey: string,
+): Promise<ContextBudgetStatus> {
+  const initial = contextBudget({ ...settings, baseUrl })
+  if (settings.modelThinkingAdapter !== 'vllm' || initial.contextWindowKnown) return initial
+  const discovered = await discoverVllmContextWindow(baseUrl, apiKey)
+  return discovered === null ? initial : contextBudgetFromServerMetrics(settings, discovered)
+}
+
 /**
  * Resolve the effective settings: explicitly supplied form values win, then the
  * saved Web UI settings, then the process environment, then the defaults.
@@ -147,47 +213,36 @@ function extractModelIds(payload: unknown): string[] {
  * LIEBIAN_BASE_URL / DEEPSEEK_BASE_URL or in the Web UI.
  */
 export async function resolveModelConfig(tasksRoot: string, input: ModelConfigInput): Promise<ConfigResolution> {
-  const requestKey = text(input.apiKey)
-  if (requestKey.length > 4096) throw new AppError('INVALID_ARGUMENT', 'API Key 过长')
   const resolved = await resolveWebSettings(tasksRoot)
-  const saved = resolved.settings
-
-  const apiKey = requestKey || saved.apiKey
-  const apiKeySource: ApiKeySource =
-    requestKey.length > 0
-      ? 'request'
-      : resolved.sources.apiKey === 'saved'
-        ? 'saved'
-        : resolved.sources.apiKey === 'environment'
-          ? 'environment'
-          : 'none'
-  const provider = text(input.provider) || saved.provider
-  const model = text(input.model) || saved.model
-  const configuredBase = text(input.baseUrl) || saved.baseUrl
-  const identity = { apiKey, apiKeySource, provider, model }
-
-  if (apiKey.length === 0) {
-    return {
-      ok: false,
-      config: identity,
-      message:
-        '没有可用的 API Key：请在弹窗中填写，或保存配置，或在启动 Web UI 的环境里设置 ' +
-        'LIEBIAN_API_KEY（兼容旧名 DEEPSEEK_API_KEY）。',
-    }
+  let settings
+  try {
+    settings = applySettingsInput(resolved, input as Record<string, unknown>)
+    validateModelSettings(settings)
+  } catch (error) {
+    const message = error instanceof AppError ? error.message : describeError(error)
+    return { ok: false, config: { ...resolved.settings, settings: resolved.settings, apiKeySource: resolved.sources.apiKey }, message }
   }
-
-  const rawBase =
-    configuredBase.length > 0
-      ? configuredBase
-      : provider === 'deepseek-official'
-        ? DEFAULT_BASE_URL
-        : ''
+  const requestKey = text(input.apiKey)
+  const apiKeySource: ApiKeySource = requestKey.length > 0 ? 'request' : resolved.sources.apiKey
+  const identity = {
+    apiKey: settings.apiKey,
+    apiKeySource,
+    modelApiProtocol: settings.modelApiProtocol,
+    provider: settings.provider,
+    model: settings.model,
+    settings,
+  }
+  const rawBase = settings.baseUrl.length > 0
+    ? settings.baseUrl
+    : settings.modelApiProtocol === 'deepseek' && settings.provider === 'deepseek-official'
+      ? DEFAULT_BASE_URL
+      : ''
   if (rawBase.length === 0) {
     return {
       ok: false,
       config: identity,
       message:
-        `provider「${provider}」没有可用的 Base URL：请填写 OpenAI 兼容的 Base URL，` +
+        `provider「${settings.provider}」没有可用的 Base URL：请填写 OpenAI 兼容的 Base URL，` +
         '或设置环境变量 LIEBIAN_BASE_URL（兼容旧名 DEEPSEEK_BASE_URL）。',
     }
   }
@@ -195,7 +250,7 @@ export async function resolveModelConfig(tasksRoot: string, input: ModelConfigIn
   if (baseUrl === null) {
     return { ok: false, config: identity, message: `Base URL 不是合法的 http(s) 地址：${rawBase}` }
   }
-  return { ok: true, config: { ...identity, baseUrl } }
+  return { ok: true, config: { ...identity, baseUrl, settings } }
 }
 
 /**
@@ -204,16 +259,22 @@ export async function resolveModelConfig(tasksRoot: string, input: ModelConfigIn
  */
 export async function testModelConfig(tasksRoot: string, input: ModelConfigInput): Promise<ModelTestResult> {
   const resolved = await resolveModelConfig(tasksRoot, input)
+  const fallbackSettings = resolved.config.settings ?? (await resolveWebSettings(tasksRoot)).settings
   const base: Omit<ModelTestResult, 'success' | 'message' | 'latencyMs'> = {
-    provider: resolved.config.provider,
-    model: resolved.config.model,
+    provider: resolved.config.provider ?? fallbackSettings.provider,
+    model: resolved.config.model ?? fallbackSettings.model,
     endpoint: '',
-    apiKeySource: resolved.config.apiKeySource,
+    apiKeySource: resolved.config.apiKeySource ?? 'none',
+    protocol: resolved.config.modelApiProtocol ?? fallbackSettings.modelApiProtocol,
+    contextWindow: contextBudget({ ...fallbackSettings, model: resolved.config.model ?? fallbackSettings.model, baseUrl: resolved.config.baseUrl ?? fallbackSettings.baseUrl, provider: resolved.config.provider ?? fallbackSettings.provider }),
   }
   if (!resolved.ok) return { success: false, ...base, latencyMs: 0, message: resolved.message }
+  const valid = resolved.config
 
-  const { apiKey, model, baseUrl } = resolved.config
-  const endpoint = chatCompletionsUrl(baseUrl)
+  base.contextWindow = await contextWindowForConfig(valid.settings, valid.baseUrl, valid.apiKey)
+
+  const { apiKey, model, baseUrl } = valid
+  const endpoint = valid.modelApiProtocol === 'deepseek' ? deepSeekMessagesUrl(baseUrl) : chatCompletionsUrl(baseUrl)
   base.endpoint = endpoint
 
   const started = Date.now()
@@ -222,15 +283,17 @@ export async function testModelConfig(tasksRoot: string, input: ModelConfigInput
     response = await fetch(endpoint, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${apiKey}`,
+        ...(valid.modelApiProtocol === 'deepseek'
+          ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+          : apiKey.length > 0 ? { authorization: `Bearer ${apiKey}` } : {}),
         'content-type': 'application/json',
         accept: 'application/json',
       },
       body: JSON.stringify({
         model,
-        messages: [{ role: 'user', content: 'Connectivity check. Reply with exactly: OK' }],
-        max_tokens: 8,
-        temperature: 0,
+        ...(valid.modelApiProtocol === 'deepseek'
+          ? { max_tokens: Math.min(valid.settings.modelMaxTokens, 256_000), messages: [{ role: 'user', content: 'Connectivity check. Reply with exactly: OK' }] }
+          : { messages: [{ role: 'user', content: 'Connectivity check. Reply with exactly: OK' }], max_tokens: 8, temperature: 0 }),
         stream: false,
       }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -275,12 +338,14 @@ export async function testModelConfig(tasksRoot: string, input: ModelConfigInput
       message: '模型接口返回成功，但响应不是 JSON；请检查 Base URL 是否指向 OpenAI 兼容接口。',
     }
   }
-  const choices = (payload as Record<string, unknown>).choices
+  const record = payload as Record<string, unknown>
+  const choices = record.choices
   const first = Array.isArray(choices) ? (choices[0] as Record<string, unknown> | undefined) : undefined
   const message = first?.message as Record<string, unknown> | undefined
-  const reply = flatten(
-    typeof message?.content === 'string' ? message.content : typeof first?.text === 'string' ? first.text : '',
-  ).slice(0, MAX_REPLY)
+  const deepSeekContent = Array.isArray(record.content) ? record.content.map((part) => typeof part === 'object' && part !== null ? (part as Record<string, unknown>).text : '').filter((part): part is string => typeof part === 'string').join('') : ''
+  const reply = flatten(valid.modelApiProtocol === 'deepseek'
+    ? deepSeekContent
+    : typeof message?.content === 'string' ? message.content : typeof first?.text === 'string' ? first.text : '').slice(0, MAX_REPLY)
 
   return {
     success: true,
@@ -298,21 +363,30 @@ export async function testModelConfig(tasksRoot: string, input: ModelConfigInput
 /** Query the OpenAI-compatible `/models` endpoint with the effective settings. */
 export async function listModelConfig(tasksRoot: string, input: ModelConfigInput): Promise<ModelListResult> {
   const resolved = await resolveModelConfig(tasksRoot, input)
+  const fallbackSettings = resolved.config.settings ?? (await resolveWebSettings(tasksRoot)).settings
   const base = {
-    provider: resolved.config.provider,
-    apiKeySource: resolved.config.apiKeySource,
+    provider: resolved.config.provider ?? fallbackSettings.provider,
+    apiKeySource: resolved.config.apiKeySource ?? 'none',
     endpoint: '',
     models: [] as string[],
+    protocol: resolved.config.modelApiProtocol ?? fallbackSettings.modelApiProtocol,
+    contextWindow: contextBudget({ ...fallbackSettings, model: resolved.config.model ?? fallbackSettings.model, baseUrl: resolved.config.baseUrl ?? fallbackSettings.baseUrl, provider: resolved.config.provider ?? fallbackSettings.provider }),
   }
   if (!resolved.ok) return { success: false, ...base, latencyMs: 0, message: resolved.message }
+  const valid = resolved.config
 
-  const endpoint = modelsUrl(resolved.config.baseUrl)
+  base.contextWindow = await contextWindowForConfig(valid.settings, valid.baseUrl, valid.apiKey)
+
+  if (valid.modelApiProtocol === 'deepseek') {
+    return { success: false, ...base, latencyMs: 0, message: 'DeepSeek Messages 原生接口不提供 OpenAI /models 列表；请手动填写 Model。' }
+  }
+  const endpoint = modelsUrl(valid.baseUrl)
   base.endpoint = endpoint
   const started = Date.now()
   let response: Response
   try {
     response = await fetch(endpoint, {
-      headers: { authorization: `Bearer ${resolved.config.apiKey}`, accept: 'application/json' },
+      headers: { ...(valid.apiKey.length > 0 ? { authorization: `Bearer ${valid.apiKey}` } : {}), accept: 'application/json' },
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
   } catch (error) {

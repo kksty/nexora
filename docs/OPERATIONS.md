@@ -108,7 +108,7 @@ node scripts/analyze-diagnostics.mjs tasks/<任务ID> .scratch/diagnostics-summa
 
 ## 模型、镜像与数据
 
-模型默认 `deepseek-official/deepseek-flash`，harness 固定 `@deepseek-ai/dsh@0.2.1-rc.2`。`.env` 支持 `LIEBIAN_PROVIDER`、`LIEBIAN_MODEL`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_API_KEY`。Web 保存的 API 配置优先，未保存时回退到环境变量。`LIEBIAN_MODEL_CONCURRENCY` 默认 4，限制每个任务所有 work 合计的在飞模型请求数；工具执行、等待与退避不占名额。
+模型默认 `deepseek-official/deepseek-flash`，harness 固定 `@deepseek-ai/dsh@0.2.1-rc.2`。`.env` 支持 `LIEBIAN_PROVIDER`、`LIEBIAN_MODEL`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_API_KEY`。Web 保存的 API 配置优先，未保存时回退到环境变量。`LIEBIAN_MODEL_CONCURRENCY` 默认 2，限制每个任务所有 work 合计的在飞模型请求数；工具执行、等待与退避不占名额。
 
 镜像包含 Node 24、harness、bash、curl、git、Python、nmap、masscan、sqlmap、ffuf、tcpdump 等工具；不是全量工具发行版。构建变量：`APT_MIRROR`（默认清华 Debian 源）、`NPM_REGISTRY`、`DOCKER_CLI_IMAGE`。首次 apt 安装证书前使用 http 镜像源。
 

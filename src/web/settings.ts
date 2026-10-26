@@ -1,281 +1,240 @@
-/**
- * Web UI-owned API settings.
- *
- * Precedence, highest first:
- *   1. values typed into the Web UI dialog (per request, never persisted here)
- *   2. values saved from the Web UI  -> tasks/.web-settings.json
- *   3. the process environment      -> LIEBIAN_* / legacy DEEPSEEK_*
- *   4. built-in defaults
- *
- * Once `.web-settings.json` exists its fields are authoritative, including an
- * empty API Key or Base URL. That is what lets the UI override - or switch off -
- * a value that came from the environment. `clearWebSettings` drops the file so
- * the environment applies again.
- *
- * The API key is only ever returned to the browser as a boolean plus the name of
- * the layer it came from.
- */
+/** Web-owned model settings. Saved > environment > default; secrets stay private. */
 import { chmod, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readTextIfExists, writeFileAtomic } from '../util/atomic.ts'
-import { DEFAULT_MODEL_CONCURRENCY, parseModelConcurrency } from '../util/semaphore.ts'
-import { DEFAULT_MODEL_MAX_TOKENS, envModelMaxTokens, envModelThinking, parseModelMaxTokens, parseModelThinking, type ModelThinking } from '../util/model-limits.ts'
+import { AppError } from '../util/errors.ts'
+import { parseModelConcurrency } from '../util/semaphore.ts'
+import {
+  MODEL_POLICY_ENV,
+  MODEL_POLICY_PARSERS,
+  contextBudget,
+  validateContextBudget,
+  type ContextBudgetStatus,
+  type ModelPolicy,
+} from '../util/model-limits.ts'
 
-export interface WebSettings {
+export interface WebSettings extends ModelPolicy {
   apiKey: string
   provider: string
   model: string
   baseUrl: string
   modelConcurrency: number
-  /** Per-response output budget handed to the harness. */
-  modelMaxTokens: number
-  /** Reasoning intensity; `off` disables extended thinking. */
-  modelThinking: ModelThinking
 }
 
-/** Which layer a resolved value came from. */
 export type SettingsSource = 'saved' | 'environment' | 'default'
-/** A credential additionally has a "nothing configured" state. */
 export type ApiKeySource = SettingsSource | 'none'
-
-export interface SettingsSources {
-  apiKey: ApiKeySource
-  provider: SettingsSource
-  model: SettingsSource
-  baseUrl: SettingsSource
-  modelConcurrency: SettingsSource
-  modelMaxTokens: SettingsSource
-  modelThinking: SettingsSource
-}
-
-export interface PublicWebSettings {
-  apiKeySet: boolean
-  apiKeySource: ApiKeySource
-  provider: string
-  model: string
-  baseUrl: string
-  modelConcurrency: number
-  modelMaxTokens: number
-  modelThinking: ModelThinking
-  sources: SettingsSources
-  /** True when `.web-settings.json` exists and therefore shadows the environment. */
-  savedOverride: boolean
-}
+export type SettingsSources = { [K in keyof WebSettings]: K extends 'apiKey' ? ApiKeySource : SettingsSource }
 
 export interface ResolvedWebSettings {
   settings: WebSettings
   sources: SettingsSources
   savedOverride: boolean
+  savedInvalid: boolean
 }
 
-const DEFAULT_PROVIDER = 'deepseek-official'
-const DEFAULT_MODEL = 'deepseek-flash'
+export interface PublicWebSettings extends Omit<WebSettings, 'apiKey'>, ContextBudgetStatus {
+  apiKeySet: boolean
+  apiKeySource: ApiKeySource
+  sources: SettingsSources
+  savedOverride: boolean
+  savedInvalid: boolean
+  settingsApply: 'next-runtime'
+}
 
-/** Provider-neutral names first, legacy DeepSeek-only names second. */
 export const ENV_API_KEY = ['LIEBIAN_API_KEY', 'DEEPSEEK_API_KEY'] as const
 export const ENV_BASE_URL = ['LIEBIAN_BASE_URL', 'DEEPSEEK_BASE_URL'] as const
 export const ENV_PROVIDER = 'LIEBIAN_PROVIDER'
 export const ENV_MODEL = 'LIEBIAN_MODEL'
 
-/** First non-empty value among `names`, trimmed. */
 export function envText(...names: readonly string[]): string {
   for (const name of names) {
     const value = (process.env[name] ?? '').trim()
-    if (value.length > 0) return value
+    if (value) return value
   }
   return ''
 }
 
-function envApiKey(): string {
-  return envText(...ENV_API_KEY)
+const text = (value: unknown): string => typeof value === 'string' ? value.trim() : ''
+const settingsFile = (root: string): string => join(root, '.web-settings.json')
+const parsers = {
+  ...MODEL_POLICY_PARSERS,
+  modelConcurrency: (value: unknown) => parseModelConcurrency(value, 2),
+}
+const envNames = { ...MODEL_POLICY_ENV, modelConcurrency: 'LIEBIAN_MODEL_CONCURRENCY' }
+
+/** The legacy secret is valid only for its original official DeepSeek host. */
+export function canUseLegacyKey(s: Pick<WebSettings, 'modelApiProtocol' | 'baseUrl' | 'provider'>): boolean {
+  return s.modelApiProtocol === 'deepseek' && s.provider === 'deepseek-official'
+    && (!s.baseUrl || /^https:\/\/api\.deepseek\.com\/?$/.test(s.baseUrl))
 }
 
-function envBaseUrl(): string {
-  return envText(...ENV_BASE_URL)
-}
-
-function envProvider(): string {
-  return envText(ENV_PROVIDER) || DEFAULT_PROVIDER
-}
-
-function envModel(): string {
-  return envText(ENV_MODEL) || DEFAULT_MODEL
-}
-
-/** Web UI configuration is forgiving: a bad env value falls back to 4. */
-function envModelConcurrency(): number {
-  try {
-    return parseModelConcurrency(process.env.LIEBIAN_MODEL_CONCURRENCY)
-  } catch {
-    return DEFAULT_MODEL_CONCURRENCY
-  }
-}
-
-function settingsFile(tasksRoot: string): string {
-  return join(tasksRoot, '.web-settings.json')
-}
-
-function asString(value: unknown, fallback = ''): string {
-  return typeof value === 'string' ? value.trim() : fallback
-}
-
-/** Raw saved JSON, or null when the file is missing or unusable. */
-async function readSavedSettings(tasksRoot: string): Promise<Record<string, unknown> | null> {
-  const raw = await readTextIfExists(settingsFile(tasksRoot))
-  if (raw === null) return null
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null) return null
-    return parsed as Record<string, unknown>
-  } catch {
-    return null
-  }
-}
-
-/**
- * Resolve the effective settings and remember where every value came from.
- *
- * `provider` and `model` cannot be meaningfully empty, so an empty saved value
- * falls through to the environment and then to the default. `apiKey` and
- * `baseUrl` treat an empty saved value as a deliberate override.
- */
-export async function resolveWebSettings(tasksRoot: string): Promise<ResolvedWebSettings> {
-  const saved = await readSavedSettings(tasksRoot)
-  const savedOverride = saved !== null
-
-  const savedKey = saved === null ? '' : asString(saved.apiKey)
-  const savedProvider = saved === null ? '' : asString(saved.provider)
-  const savedModel = saved === null ? '' : asString(saved.model)
-  const savedBaseUrl = saved === null ? '' : asString(saved.baseUrl)
-
-  const envKey = envApiKey()
-  const envBase = envBaseUrl()
-  const envProviderValue = envText(ENV_PROVIDER)
-  const envModelValue = envText(ENV_MODEL)
-
-  const apiKey = saved === null ? envKey : savedKey
-  const apiKeySource: ApiKeySource =
-    apiKey.length === 0 ? 'none' : saved === null ? 'environment' : 'saved'
-
-  const provider = savedProvider.length > 0 ? savedProvider : envProvider()
-  const providerSource: SettingsSource =
-    savedProvider.length > 0 ? 'saved' : envProviderValue.length > 0 ? 'environment' : 'default'
-
-  const model = savedModel.length > 0 ? savedModel : envModel()
-  const modelSource: SettingsSource =
-    savedModel.length > 0 ? 'saved' : envModelValue.length > 0 ? 'environment' : 'default'
-
-  const baseUrl = saved === null ? envBase : savedBaseUrl
-  const baseUrlSource: SettingsSource =
-    saved === null ? (envBase.length > 0 ? 'environment' : 'default') : 'saved'
-
-  const storedConcurrency = saved === null ? undefined : saved.modelConcurrency
-  let modelConcurrency = envModelConcurrency()
-  let concurrencySource: SettingsSource =
-    process.env.LIEBIAN_MODEL_CONCURRENCY === undefined ? 'default' : 'environment'
-  if (storedConcurrency !== undefined) {
+export async function resolveWebSettings(root: string): Promise<ResolvedWebSettings> {
+  const raw = await readTextIfExists(settingsFile(root))
+  let saved: Record<string, unknown> | null = null
+  let savedInvalid = false
+  if (raw !== null) {
     try {
-      modelConcurrency = parseModelConcurrency(storedConcurrency, envModelConcurrency())
-      concurrencySource = 'saved'
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('invalid')
+      saved = parsed as Record<string, unknown>
     } catch {
-      // A hand-edited bad value falls back to the environment, then to 4.
+      savedInvalid = true
     }
   }
 
-  const storedMaxTokens = saved === null ? undefined : saved.modelMaxTokens
-  let modelMaxTokens = envModelMaxTokens()
-  let maxTokensSource: SettingsSource =
-    (process.env.LIEBIAN_MODEL_MAX_TOKENS ?? '').trim().length === 0 ? 'default' : 'environment'
-  if (storedMaxTokens !== undefined) {
+  const settings = {} as WebSettings
+  const sources = {} as SettingsSources
+  for (const [key, parse] of Object.entries(parsers)) {
+    const typed = key as keyof typeof parsers
+    let value = parse(undefined)
+    let source: SettingsSource = 'default'
+    const env = process.env[envNames[typed]]
+    if (env?.trim()) {
+      try {
+        value = parse(env)
+        source = 'environment'
+      } catch {
+        // An illegal environment value is defaulted, never reported as env-sourced.
+      }
+    }
+    if (saved?.[typed] !== undefined) {
+      try {
+        if (saved[typed] === null || saved[typed] === '') throw new Error('empty')
+        value = parse(saved[typed])
+        source = 'saved'
+      } catch {
+        value = parse(undefined)
+        source = 'default'
+      }
+    }
+    Object.assign(settings, { [typed]: value })
+    Object.assign(sources, { [typed]: source })
+  }
+
+  for (const [key, envName, fallback] of [
+    ['provider', ENV_PROVIDER, 'deepseek-official'],
+    ['model', ENV_MODEL, 'deepseek-flash'],
+  ] as const) {
+    const stored = text(saved?.[key])
+    const env = envText(envName)
+    settings[key] = stored || env || fallback
+    sources[key] = stored ? 'saved' : env ? 'environment' : 'default'
+  }
+
+  const envBase = settings.modelApiProtocol === 'deepseek'
+    ? envText(...ENV_BASE_URL)
+    : envText('LIEBIAN_BASE_URL')
+  settings.baseUrl = saved && 'baseUrl' in saved ? text(saved.baseUrl) : envBase
+  sources.baseUrl = saved && 'baseUrl' in saved ? 'saved' : envBase ? 'environment' : 'default'
+
+  const explicitKey = process.env.LIEBIAN_API_KEY?.trim()
+  const envKey = explicitKey || (canUseLegacyKey(settings) ? envText('DEEPSEEK_API_KEY') : '')
+  settings.apiKey = saved && 'apiKey' in saved ? text(saved.apiKey) : envKey
+  sources.apiKey = settings.apiKey ? (saved && 'apiKey' in saved ? 'saved' : 'environment') : 'none'
+
+  return { settings, sources, savedOverride: raw !== null, savedInvalid }
+}
+
+export async function loadWebSettings(root: string): Promise<WebSettings> {
+  return (await resolveWebSettings(root)).settings
+}
+
+export const effectiveWebSettings = loadWebSettings
+
+/** Shared by save, model probes and task launch. */
+export function validateModelSettings(s: WebSettings): void {
+  if (!s.provider) throw new AppError('INVALID_ARGUMENT', 'Provider 不能为空')
+  if (!s.model) throw new AppError('INVALID_ARGUMENT', 'Model 不能为空')
+  if (s.modelApiProtocol === 'deepseek' && !s.apiKey) {
+    throw new AppError('INVALID_ARGUMENT', 'DeepSeek Messages 协议必须提供非空 API Key（LIEBIAN_API_KEY 或 Web API Key）')
+  }
+  if (!s.baseUrl && (s.modelApiProtocol !== 'deepseek' || s.provider !== 'deepseek-official')) {
+    throw new AppError('INVALID_ARGUMENT', '此协议 / provider 必须配置 Base URL')
+  }
+  if (s.baseUrl) {
     try {
-      modelMaxTokens = parseModelMaxTokens(storedMaxTokens, envModelMaxTokens())
-      maxTokensSource = 'saved'
+      const url = new URL(s.baseUrl)
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+        throw new Error('url')
+      }
+      if (/\/(?:chat\/completions|messages|models)\/?$/.test(url.pathname)) throw new Error('endpoint')
     } catch {
-      // A hand-edited bad value falls back to the environment, then to the default.
+      throw new AppError('INVALID_ARGUMENT', 'Base URL 必须是 http(s) 基础地址，不含凭据、查询或 /chat/completions、/messages、/models')
     }
   }
+  validateContextBudget(s)
+}
 
-  const storedThinking = saved === null ? undefined : saved.modelThinking
-  let modelThinking = envModelThinking()
-  let thinkingSource: SettingsSource =
-    (process.env.LIEBIAN_MODEL_THINKING ?? '').trim().length === 0 ? 'default' : 'environment'
-  if (storedThinking !== undefined) {
-    try {
-      modelThinking = parseModelThinking(storedThinking, envModelThinking())
-      thinkingSource = 'saved'
-    } catch {
-      // Same fallback chain as above.
-    }
+/** Apply one Web request through the same parsers used by save and launch. */
+export function applySettingsInput(current: ResolvedWebSettings, input: Record<string, unknown>): WebSettings {
+  const next = { ...current.settings }
+  for (const key of ['provider', 'model', 'baseUrl'] as const) {
+    if (typeof input[key] === 'string') next[key] = text(input[key])
   }
-
-  return {
-    settings: { apiKey, provider, model, baseUrl, modelConcurrency, modelMaxTokens, modelThinking },
-    sources: {
-      apiKey: apiKeySource,
-      provider: providerSource,
-      model: modelSource,
-      baseUrl: baseUrlSource,
-      modelConcurrency: concurrencySource,
-      modelMaxTokens: maxTokensSource,
-      modelThinking: thinkingSource,
-    },
-    savedOverride,
+  for (const [key, parse] of Object.entries(parsers)) {
+    if (input[key] !== undefined) Object.assign(next, { [key]: parse(input[key]) })
   }
+  const requestKey = text(input.apiKey)
+  if (requestKey.length > 4096) throw new AppError('INVALID_ARGUMENT', 'API Key 过长')
+  if (requestKey) next.apiKey = requestKey
+  if (input.clearApiKey === true) next.apiKey = ''
+  // Never forward the legacy DeepSeek environment secret to another host.
+  if (!requestKey && current.sources.apiKey === 'environment' && !process.env.LIEBIAN_API_KEY?.trim()
+    && !canUseLegacyKey(next)) next.apiKey = ''
+  return next
 }
 
-/** Effective settings only; see {@link resolveWebSettings} for provenance. */
-export async function loadWebSettings(tasksRoot: string): Promise<WebSettings> {
-  return (await resolveWebSettings(tasksRoot)).settings
-}
-
-/** Saved settings take precedence; environment is the fallback. */
-export async function effectiveWebSettings(tasksRoot: string): Promise<WebSettings> {
-  return loadWebSettings(tasksRoot)
-}
-
-export async function saveWebSettings(tasksRoot: string, settings: WebSettings): Promise<void> {
-  const file = settingsFile(tasksRoot)
-  const modelConcurrency = parseModelConcurrency(settings.modelConcurrency)
-  const modelMaxTokens = parseModelMaxTokens(settings.modelMaxTokens)
-  const modelThinking = parseModelThinking(settings.modelThinking)
-  await writeFileAtomic(
-    file,
-    `${JSON.stringify({ ...settings, modelConcurrency, modelMaxTokens, modelThinking }, null, 2)}\n`,
-  )
+export async function saveWebSettings(
+  root: string,
+  input: Omit<WebSettings, keyof ModelPolicy> & Partial<ModelPolicy>,
+): Promise<void> {
+  const settings = { ...input } as WebSettings
+  for (const [key, parse] of Object.entries(parsers)) {
+    Object.assign(settings, { [key]: parse(input[key as keyof typeof input]) })
+  }
+  for (const key of ['apiKey', 'provider', 'model', 'baseUrl'] as const) settings[key] = text(settings[key])
+  validateModelSettings(settings)
+  const file = settingsFile(root)
+  await writeFileAtomic(file, `${JSON.stringify(settings, null, 2)}\n`)
   await chmod(file, 0o600).catch(() => undefined)
 }
 
-/** Drop the saved override so the environment applies again. */
-export async function clearWebSettings(tasksRoot: string): Promise<void> {
-  await rm(settingsFile(tasksRoot), { force: true })
+export async function clearWebSettings(root: string): Promise<void> {
+  await rm(settingsFile(root), { force: true })
 }
 
 export function publicWebSettings(resolved: ResolvedWebSettings): PublicWebSettings {
-  const { settings, sources, savedOverride } = resolved
+  const { apiKey, ...publicSettings } = resolved.settings
   return {
-    apiKeySet: settings.apiKey.length > 0,
-    apiKeySource: sources.apiKey,
-    provider: settings.provider,
-    model: settings.model,
-    baseUrl: settings.baseUrl,
-    modelConcurrency: settings.modelConcurrency,
-    modelMaxTokens: settings.modelMaxTokens,
-    modelThinking: settings.modelThinking,
-    sources,
-    savedOverride,
+    ...publicSettings,
+    ...contextBudget(resolved.settings),
+    apiKeySet: apiKey.length > 0,
+    apiKeySource: resolved.sources.apiKey,
+    sources: resolved.sources,
+    savedOverride: resolved.savedOverride,
+    savedInvalid: resolved.savedInvalid,
+    settingsApply: 'next-runtime',
   }
 }
 
-/** Human-readable label for a source, used by the Web UI hints. */
 export function sourceLabel(source: SettingsSource | 'none'): string {
-  switch (source) {
-    case 'saved':
-      return '已保存'
-    case 'environment':
-      return '环境变量'
-    case 'none':
-      return '未配置'
-    default:
-      return '默认值'
+  return ({ saved: '已保存', environment: '环境变量', default: '默认值', none: '未配置' })[source]
+}
+
+/** Container environment for one immutable runtime generation. */
+export function modelSettingsEnvironment(s: WebSettings): NodeJS.ProcessEnv {
+  validateModelSettings(s)
+  const env: NodeJS.ProcessEnv = {
+    LIEBIAN_API_KEY: s.apiKey,
+    LIEBIAN_BASE_URL: s.baseUrl,
+    LIEBIAN_PROVIDER: s.modelApiProtocol === 'openai-compatible' ? 'liebian-openai-compatible' : s.provider,
+    LIEBIAN_MODEL: s.model,
+    LIEBIAN_MODEL_CONCURRENCY: String(s.modelConcurrency),
   }
+  for (const [key, name] of Object.entries(MODEL_POLICY_ENV)) env[name] = String(s[key as keyof ModelPolicy])
+  if (s.modelApiProtocol === 'deepseek') {
+    env.DEEPSEEK_API_KEY = s.apiKey
+    env.DEEPSEEK_BASE_URL = s.baseUrl
+  }
+  return env
 }

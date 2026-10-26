@@ -105,3 +105,77 @@ test('会话读取：会话文件缺失时返回空列表而不是报错', async
   assert.deepEqual(result.entries, [])
   assert.equal(result.truncated, false)
 })
+
+test('会话读取：截断原因、尾部分页和损坏日志都可见', async (t) => {
+  const paths = await scaffold(t)
+  await writeSession(paths, [
+    { type: 'user/message', seq: 1, time: t0, data: { content: [{ type: 'text', text: '最早一条' }] } },
+  ])
+  const file = join(paths.sessionsDir, '--tasks-T-20261026-120000-abcd--', 'sess-1', 'session.v4.jsonl')
+  await writeFile(
+    file,
+    `${JSON.stringify({ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(9 * 1024 * 1024) }] } })}\n` +
+      `${JSON.stringify({ type: 'user/message', data: { content: [{ type: 'text', text: '最后一条' }] } })}\n`,
+    'utf8',
+  )
+
+  const result = await readWorkConversation(paths, 'W-0001')
+  assert.equal(result.entries.at(-1)?.text, '最后一条')
+  assert.equal(result.truncated, true)
+  assert.ok(result.truncationReasons?.includes('size'))
+  assert.equal(result.pagination.mode, 'tail')
+  assert.ok(result.pagination.omittedBytes > 0)
+  assert.ok(result.pagination.readBytes <= 8 * 1024 * 1024)
+
+  await writeFile(
+    file,
+    `${JSON.stringify({ type: 'user/message', data: { content: [{ type: 'text', text: '保留' }] } })}\n{bad json}\n` +
+      `${JSON.stringify({ type: 'user/message', data: { content: [{ type: 'text', text: '继续' }] } })}\n`,
+    'utf8',
+  )
+  const corrupt = await readWorkConversation(paths, 'W-0001')
+  assert.equal(corrupt.entries.length, 2)
+  assert.ok(corrupt.truncationReasons?.includes('corrupt'))
+
+  await writeFile(
+    file,
+    `${JSON.stringify({ type: 'user/message', data: { content: [{ type: 'text', text: '已完整' }] } })}\n` +
+      JSON.stringify({ type: 'user/message', data: { content: [{ type: 'text', text: '写入中' }] } }).slice(0, -3),
+    'utf8',
+  )
+  const partial = await readWorkConversation(paths, 'W-0001')
+  assert.deepEqual(partial.entries.map((entry) => entry.text), ['已完整'])
+  assert.ok(partial.truncationReasons?.includes('partial'))
+  assert.equal(partial.truncationReasons?.includes('corrupt'), false)
+})
+
+test('会话读取：task 目录之外不能借会话 ID 读取文件', async (t) => {
+  const paths = await scaffold(t)
+  await writeFile(
+    paths.stateFile,
+    JSON.stringify({ works: { 'W-0001': { id: 'W-0001', sessionId: '../../outside' } } }),
+    'utf8',
+  )
+  await assert.rejects(
+    () => readWorkConversation(paths, 'W-0001'),
+    (error: unknown) => (error as { code?: string }).code === 'STATE_CORRUPT',
+  )
+})
+
+test('会话读取：同名会话出现在多个任务目录时拒绝猜测', async (t) => {
+  const paths = await scaffold(t)
+  await writeSession(paths, [
+    { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '第一份' }] } },
+  ])
+  const other = join(paths.sessionsDir, '--other-task--', 'sess-1')
+  await mkdir(other, { recursive: true })
+  await writeFile(
+    join(other, 'session.v4.jsonl'),
+    `${JSON.stringify({ type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '另一份' }] } })}\n`,
+    'utf8',
+  )
+  await assert.rejects(
+    () => readWorkConversation(paths, 'W-0001'),
+    (error: unknown) => (error as { code?: string }).code === 'STATE_CORRUPT',
+  )
+})

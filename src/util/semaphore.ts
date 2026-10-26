@@ -14,7 +14,7 @@
 import { randomUUID } from 'node:crypto'
 import { AppError } from './errors.ts'
 
-export const DEFAULT_MODEL_CONCURRENCY = 4
+export const DEFAULT_MODEL_CONCURRENCY = 2
 
 export interface ModelPermit {
   permitId: string
@@ -78,7 +78,7 @@ export function parseModelConcurrency(value: unknown, fallback = DEFAULT_MODEL_C
   return parsed
 }
 
-/** Resolve `LIEBIAN_MODEL_CONCURRENCY` with the documented default of 4. */
+/** Resolve `LIEBIAN_MODEL_CONCURRENCY` with the documented default of 2. */
 export function modelConcurrencyFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   return parseModelConcurrency(env.LIEBIAN_MODEL_CONCURRENCY)
 }
